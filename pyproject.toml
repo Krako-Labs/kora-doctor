@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kora-doctor"
+version = "0.1.0"
+description = "Find the LLM calls your AI agent may never have needed."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Krako Labs" }]
+keywords = ["ai", "agents", "llm", "audr", "observability", "cost", "optimization"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.scripts]
+kora-doctor = "kora_doctor.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Krako-Labs/kora-doctor"
+Repository = "https://github.com/Krako-Labs/kora-doctor"
+Issues = "https://github.com/Krako-Labs/kora-doctor/issues"
+
+[tool.setuptools.packages.find]
+include = ["kora_doctor*"]

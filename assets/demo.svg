@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1060" height="606" viewBox="0 0 1060 606">
+<rect width="100%" height="100%" rx="14" fill="#0d1117"/>
+<circle cx="24" cy="22" r="6" fill="#ff5f56"/>
+<circle cx="44" cy="22" r="6" fill="#ffbd2e"/>
+<circle cx="64" cy="22" r="6" fill="#27c93f"/>
+<text x="28" y="54" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3">KORA Doctor</text>
+<text x="28" y="76" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3">Find the LLM calls your AI agent may never have needed.</text>
+<text x="28" y="98" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3"></text>
+<text x="28" y="120" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3">Observed: 11 records · 2 runs · 11 model calls · 0 tool calls</text>
+<text x="28" y="142" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3">Observed cost:                      $0.1050</text>
+<text x="28" y="164" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3">Potentially avoidable:              $0.0936  (89%)</text>
+<text x="28" y="186" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3">Estimated optimized cost:           $0.0114</text>
+<text x="28" y="208" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3"></text>
+<text x="28" y="230" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3">Candidates</text>
+<text x="28" y="252" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3">-----------------------------------------------</text>
+<text x="28" y="274" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3">Duplicate/repeated calls           5</text>
+<text x="28" y="296" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3">Cache/reuse candidates             5</text>
+<text x="28" y="318" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3">Deterministic candidates          11</text>
+<text x="28" y="340" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3">Smaller-model candidates          11</text>
+<text x="28" y="362" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3">Orchestration overhead             5</text>
+<text x="28" y="384" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3"></text>
+<text x="28" y="406" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3">Top findings</text>
+<text x="28" y="428" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3">-----------------------------------------------</text>
+<text x="28" y="450" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3">[MEDIUM] 9 model calls in a single agent run (5 calls)</text>
+<text x="28" y="472" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3">         More than four model calls were observed in one run. Later calls are marked as orchestration-overhead candidates; legitimate long-horizon work may still need them.</text>
+<text x="28" y="494" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3">[MEDIUM] 2 repeated model call(s) in one run (2 calls)</text>
+<text x="28" y="516" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3">         Same run, model/resource, operation, and reported usage counters repeat. AUDR has no prompt body, so this is a strong duplicate candidate, not proof.</text>
+<text x="28" y="538" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3">[MEDIUM] 1 repeated model call(s) in one run (1 call)</text>
+<text x="28" y="560" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3">         Same run, model/resource, operation, and reported usage counters repeat. AUDR has no prompt body, so this is a strong duplicate candidate, not proof.</text>
+</svg>
