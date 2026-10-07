@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Tuple
 from .model import AuditReport, Finding
 
 
+CATEGORY_REPEATED_TOOL = "repeated_tool_retrieval"
+CATEGORY_CONTEXT = "context_amplification"
 CATEGORY_DUPLICATE = "duplicate_repeated"
 CATEGORY_CACHE = "cache_reuse"
 CATEGORY_DETERMINISTIC = "deterministic_candidate"
@@ -15,6 +17,8 @@ DETERMINISTIC_KEYWORDS = (
     "classif", "route", "routing", "validat", "schema", "format",
     "extract", "normaliz", "mapping", "parse", "categor", "filter",
 )
+
+VALIDATION_KEYWORDS = ("validat", "schema", "json", "format", "parse")
 
 FRONTIER_MODEL_PATTERNS = (
     r"gpt[-_ ]?(?:5|6)",
@@ -59,6 +63,18 @@ def _usage_signature(record: Dict[str, Any]) -> Tuple[Any, ...]:
     )
 
 
+def _tool_signature(record: Dict[str, Any]) -> Tuple[Any, ...]:
+    resource = record.get("resource", {})
+    tool = record.get("usage", {}).get("tool", {})
+    return (
+        resource.get("provider"),
+        resource.get("name"),
+        resource.get("operation"),
+        resource.get("modality"),
+        tool.get("type"),
+    )
+
+
 def _context_text(record: Dict[str, Any]) -> str:
     run = record.get("run", {})
     attribution = record.get("attribution", {})
@@ -83,11 +99,27 @@ def _token_total(record: Dict[str, Any]) -> int:
     )
 
 
+def _input_tokens(record: Dict[str, Any]):
+    value = record.get("usage", {}).get("llm", {}).get("input_tokens")
+    return int(value) if isinstance(value, (int, float)) and value >= 0 else None
+
+
 def _frontier_model(name: str) -> bool:
     value = (name or "").lower()
     if any(marker in value for marker in LOW_COST_MODEL_MARKERS):
         return False
     return any(re.search(pattern, value) for pattern in FRONTIER_MODEL_PATTERNS)
+
+
+def _ordered(group: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(
+        group,
+        key=lambda r: (
+            r.get("run", {}).get("step") is None,
+            r.get("run", {}).get("step") or 10**9,
+            str(r.get("timing", {}).get("event_time", "")),
+        ),
+    )
 
 
 def analyze(records: List[Dict[str, Any]]) -> AuditReport:
@@ -115,6 +147,35 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
 
     findings: List[Finding] = []
 
+    # 1. Repeated tool/resource use inside one run.
+    # AUDR v1.0.0 does not carry normalized tool arguments, so this is observed
+    # repetition of the same resource/operation, not proof of identical requests.
+    by_run_tool = defaultdict(list)
+    for record in tool_records:
+        run_id = str(record["run"]["run_id"])
+        by_run_tool[(run_id, _tool_signature(record))].append(record)
+
+    for (run_id, signature), group in by_run_tool.items():
+        if len(group) >= 2:
+            duplicates = _ordered(group)[1:]
+            resource_name = str(group[0].get("resource", {}).get("name", "tool"))
+            findings.append(
+                Finding(
+                    category=CATEGORY_REPEATED_TOOL,
+                    title=f"{len(duplicates)} repeated tool/read call(s): {resource_name}",
+                    reason=(
+                        "The same AUDR tool/resource and operation repeated within one run. "
+                        "AUDR v1.0.0 does not include normalized tool arguments, so this is an observed "
+                        "repeat and a reuse candidate, not proof that the second call was unnecessary."
+                    ),
+                    confidence="low",
+                    record_ids=[str(r["record_id"]) for r in duplicates],
+                    run_ids=[run_id],
+                    saving_ratio=0.0,
+                )
+            )
+
+    # 2. Model calls with identical usage/resource signatures in one run.
     by_run_signature = defaultdict(list)
     for record in model_records:
         run_id = str(record["run"]["run_id"])
@@ -122,7 +183,7 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
 
     for (run_id, _), group in by_run_signature.items():
         if len(group) >= 2:
-            duplicates = group[1:]
+            duplicates = _ordered(group)[1:]
             findings.append(
                 Finding(
                     category=CATEGORY_DUPLICATE,
@@ -138,6 +199,7 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
                 )
             )
 
+    # 3. Cross-run reuse candidates.
     by_signature = defaultdict(list)
     for record in model_records:
         by_signature[_usage_signature(record)].append(record)
@@ -145,7 +207,7 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
     for _, group in by_signature.items():
         run_ids = {str(r["run"]["run_id"]) for r in group}
         if len(run_ids) >= 2 and len(group) >= 2:
-            candidates = group[1:]
+            candidates = _ordered(group)[1:]
             findings.append(
                 Finding(
                     category=CATEGORY_CACHE,
@@ -161,60 +223,114 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
                 )
             )
 
+    # 4. Deterministic candidates. Validation/schema/format work is promoted to
+    # medium confidence when the call is small enough to look like a checker.
     for record in model_records:
         text = _context_text(record)
         hit = next((kw for kw in DETERMINISTIC_KEYWORDS if kw in text), None)
         if hit:
+            llm = record.get("usage", {}).get("llm", {})
+            output_tokens = llm.get("output_tokens")
+            is_validation = any(kw in text for kw in VALIDATION_KEYWORDS)
+            small_checker = isinstance(output_tokens, (int, float)) and output_tokens <= 200
+            if is_validation and small_checker:
+                title = "LLM used for deterministic validation"
+                reason = (
+                    "Run metadata indicates validation/schema/format checking and the call returned "
+                    f"{int(output_tokens)} output tokens. This is a strong candidate for JSON Schema, "
+                    "parsing, or another deterministic check."
+                )
+                confidence = "medium"
+                saving_ratio = 0.90
+            else:
+                title = "Possible deterministic step"
+                reason = (
+                    f"Run metadata contains '{hit}', a pattern often implemented with rules, parsing, "
+                    "routing, validation, or fixed mappings. Payload evidence is not available in AUDR."
+                )
+                confidence = "low"
+                saving_ratio = 0.80
+
             findings.append(
                 Finding(
                     category=CATEGORY_DETERMINISTIC,
-                    title="Possible deterministic step",
-                    reason=(
-                        f"Run metadata contains '{hit}', a pattern often implemented with rules, parsing, "
-                        "routing, validation, or fixed mappings. Payload evidence is not available in AUDR."
-                    ),
-                    confidence="low",
+                    title=title,
+                    reason=reason,
+                    confidence=confidence,
                     record_ids=[str(record["record_id"])],
                     run_ids=[str(record["run"]["run_id"])],
-                    saving_ratio=0.80,
+                    saving_ratio=saving_ratio,
                 )
             )
 
+    # 5. Context amplification and repeated static-context tax.
+    by_run_models = defaultdict(list)
     for record in model_records:
-        resource = record.get("resource", {})
-        model = str(resource.get("name", ""))
-        llm = record.get("usage", {}).get("llm", {})
-        reasoning = llm.get("reasoning_tokens")
-        total = _token_total(record)
-        if _frontier_model(model) and total and total <= 2500 and (reasoning in (None, 0)):
+        by_run_models[str(record["run"]["run_id"])].append(record)
+
+    for run_id, group in by_run_models.items():
+        ordered = _ordered(group)
+        previous = None
+        growth_records = []
+        growth_pairs = []
+        for record in ordered:
+            current = _input_tokens(record)
+            if current is None:
+                previous = current
+                continue
+            if previous is not None:
+                delta = current - previous
+                ratio = (current / previous) if previous > 0 else 0.0
+                if delta >= 500 and ratio >= 1.5:
+                    growth_records.append(record)
+                    growth_pairs.append((previous, current))
+            previous = current
+
+        if growth_records:
+            first_before, first_after = growth_pairs[0]
             findings.append(
                 Finding(
-                    category=CATEGORY_SMALLER,
-                    title=f"Short call on high-end model: {model}",
+                    category=CATEGORY_CONTEXT,
+                    title=f"Input context amplified across {len(growth_records)} call(s)",
                     reason=(
-                        f"Only {total} reported input/output tokens and no reported reasoning tokens. "
-                        "A smaller model may be sufficient, but task quality requirements are not visible in AUDR."
+                        f"Reported input tokens grew from {first_before} to {first_after} on the first "
+                        "flagged transition (>=1.5x and +500 tokens). This can indicate context carry-over, "
+                        "repeated retrieval results, or static tool definitions being paid for again."
                     ),
                     confidence="low",
-                    record_ids=[str(record["record_id"])],
-                    run_ids=[str(record["run"]["run_id"])],
-                    saving_ratio=0.50,
+                    record_ids=[str(r["record_id"]) for r in growth_records],
+                    run_ids=[run_id],
+                    saving_ratio=0.0,
                 )
             )
 
-    by_run = defaultdict(list)
-    for record in model_records:
-        by_run[str(record["run"]["run_id"])].append(record)
+        reported = [(record, _input_tokens(record)) for record in ordered]
+        reported = [(record, tokens) for record, tokens in reported if tokens is not None]
+        if len(reported) >= 3:
+            values = [tokens for _, tokens in reported]
+            low = min(values)
+            high = max(values)
+            if low >= 3000 and high <= low * 1.25:
+                later = [record for record, _ in reported[1:]]
+                findings.append(
+                    Finding(
+                        category=CATEGORY_CONTEXT,
+                        title="Persistent high input-token baseline",
+                        reason=(
+                            f"{len(reported)} sequential model calls each carried at least {low} input tokens "
+                            "with little variation. Static tool definitions or carried context may be imposing "
+                            "a repeated token tax; AUDR alone cannot identify the exact payload."
+                        ),
+                        confidence="low",
+                        record_ids=[str(r["record_id"]) for r in later],
+                        run_ids=[run_id],
+                        saving_ratio=0.0,
+                    )
+                )
 
-    for run_id, group in by_run.items():
-        ordered = sorted(
-            group,
-            key=lambda r: (
-                r.get("run", {}).get("step") is None,
-                r.get("run", {}).get("step") or 10**9,
-                str(r.get("timing", {}).get("event_time", "")),
-            ),
-        )
+    # 6. Suspicious orchestration overhead.
+    for run_id, group in by_run_models.items():
+        ordered = _ordered(group)
         if len(ordered) >= 6:
             extras = ordered[4:]
             confidence = "medium" if len(ordered) >= 8 else "low"
@@ -233,6 +349,32 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
                 )
             )
 
+    # 7. Smaller-model candidates deliberately come last. Cheaper models should
+    # not be the first answer to execution waste.
+    for record in model_records:
+        resource = record.get("resource", {})
+        model = str(resource.get("name", ""))
+        llm = record.get("usage", {}).get("llm", {})
+        reasoning = llm.get("reasoning_tokens")
+        total = _token_total(record)
+        if _frontier_model(model) and total and total <= 2500 and (reasoning in (None, 0)):
+            findings.append(
+                Finding(
+                    category=CATEGORY_SMALLER,
+                    title=f"Short call on high-end model: {model}",
+                    reason=(
+                        f"Only {total} reported input/output tokens and no reported reasoning tokens. "
+                        "A smaller model may be sufficient after execution waste is removed."
+                    ),
+                    confidence="low",
+                    record_ids=[str(record["record_id"])],
+                    run_ids=[str(record["run"]["run_id"])],
+                    saving_ratio=0.50,
+                )
+            )
+
+    # Conservative savings aggregation: findings can overlap, so only the
+    # largest saving ratio is applied to each record.
     record_by_id = {str(r["record_id"]): r for r in records}
     max_ratio_by_record: Dict[str, float] = {}
     for finding in findings:
@@ -254,11 +396,13 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
         category_record_ids[finding.category].update(finding.record_ids)
 
     category_counts = {
+        CATEGORY_REPEATED_TOOL: len(category_record_ids[CATEGORY_REPEATED_TOOL]),
+        CATEGORY_CONTEXT: len(category_record_ids[CATEGORY_CONTEXT]),
+        CATEGORY_DETERMINISTIC: len(category_record_ids[CATEGORY_DETERMINISTIC]),
         CATEGORY_DUPLICATE: len(category_record_ids[CATEGORY_DUPLICATE]),
         CATEGORY_CACHE: len(category_record_ids[CATEGORY_CACHE]),
-        CATEGORY_DETERMINISTIC: len(category_record_ids[CATEGORY_DETERMINISTIC]),
-        CATEGORY_SMALLER: len(category_record_ids[CATEGORY_SMALLER]),
         CATEGORY_ORCHESTRATION: len(category_record_ids[CATEGORY_ORCHESTRATION]),
+        CATEGORY_SMALLER: len(category_record_ids[CATEGORY_SMALLER]),
     }
 
     return AuditReport(

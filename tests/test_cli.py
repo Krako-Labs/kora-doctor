@@ -18,7 +18,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("KORA Doctor", result.stdout)
         self.assertIn("Potentially avoidable", result.stdout)
-        self.assertIn("heuristic candidates", result.stdout)
+        self.assertIn("Fix execution waste first", result.stdout)
 
     def test_cli_malformed(self):
         result = subprocess.run(
