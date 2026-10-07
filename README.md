@@ -1,12 +1,12 @@
 # KORA Doctor
 
-**Find the LLM calls your AI agent may never have needed.**
+**Find execution waste in AI agent runs.**
 
-AUDR can tell you what an agent run did and what it cost. KORA Doctor asks the next question:
+AUDR can tell you what an agent ran and what it cost. KORA Doctor asks the next question:
 
-> **Did all of that inference need to happen?**
+> **Which parts of that execution should disappear?**
 
-KORA Doctor is a small open-source CLI that analyzes [AUDR](https://openaudr.dev/) JSON/JSONL and flags calls that may be worth removing, caching, replacing with deterministic logic, or moving to a cheaper model.
+KORA Doctor is a small open-source CLI that analyzes [AUDR](https://openaudr.dev/) JSON/JSONL and surfaces waste across tool usage, context growth, deterministic work, repeated inference, orchestration, and model choice.
 
 No dashboard. No account. No hosted service.
 
@@ -40,43 +40,49 @@ kora-doctor audit audr.jsonl --json
 
 ## Example
 
-The included inefficient trace is synthetic and deliberately pathological. It is a demo of the reporting surface, not a benchmark or a claim that typical agents waste 89%.
+The v0.1.1 harness sample is synthetic and exists to exercise the heuristics. It is not a benchmark.
 
 ```text
 KORA Doctor
-Find the LLM calls your AI agent may never have needed.
+Find execution waste in AI agent runs.
 
-Observed: 11 records · 2 runs · 11 model calls · 0 tool calls
-Observed cost:                      $0.1050
-Potentially avoidable:              $0.0936  (89%)
-Estimated optimized cost:           $0.0114
+Observed: 7 records · 1 runs · 5 model calls · 2 tool calls
+Observed cost:                      $0.0660
+Potentially avoidable:              $0.0130  (20%)
+Estimated optimized cost:           $0.0530
 
-Candidates
+Execution waste candidates
 -----------------------------------------------
-Duplicate/repeated calls           5
-Cache/reuse candidates             5
-Deterministic candidates          11
-Smaller-model candidates          11
-Orchestration overhead             5
+Repeated tool/read calls           1
+Context amplification              2
+Deterministic candidates           1
+Repeated model calls               0
+Cross-run reuse candidates         0
+Orchestration overhead             0
+Smaller-model candidates           2
 ```
 
-Run the included intentionally inefficient trace to see the full current output:
+Run it:
 
 ```bash
-kora-doctor audit samples/inefficient_agent.jsonl
+kora-doctor audit samples/harness_waste.jsonl
 ```
 
 ## What it looks for
 
-KORA Doctor v0 intentionally starts with simple heuristics:
+KORA Doctor now prioritizes execution waste before model downsizing:
 
-- **Duplicate/repeated inference** — the same model/resource and usage signature repeating inside one run.
-- **Cache/reuse candidates** — the same signature appearing across multiple runs.
-- **Deterministic candidates** — model calls whose AUDR run metadata looks like classification, routing, validation, extraction, formatting, parsing, or normalization.
-- **Smaller-model candidates** — short calls on high-end models with no reported reasoning tokens.
-- **Suspicious orchestration overhead** — agent runs with many model calls where later calls deserve inspection.
+- **Repeated tool/read calls** — the same AUDR tool/resource and operation repeating inside one run.
+- **Context amplification** — input-token growth that can indicate carried retrieval results, growing context, or repeated static tool definitions.
+- **Deterministic validation** — validation/schema/format work that may belong in JSON Schema, parsing, or ordinary code instead of an LLM.
+- **Repeated inference** — model/resource and usage signatures repeating inside a run.
+- **Cross-run reuse candidates** — similar signatures appearing across multiple runs.
+- **Suspicious orchestration overhead** — long model-call chains that deserve inspection.
+- **Smaller-model candidates** — considered after execution waste is removed.
 
-The goal is not to prove that an inference call was unnecessary. The goal is to narrow a long trace down to the calls a developer should inspect first.
+**Fix execution waste first. Downsize models second.**
+
+The goal is to narrow a trace down to the execution steps a developer should inspect first.
 
 ## Why the output says “candidate”
 
@@ -92,15 +98,17 @@ KORA Doctor therefore uses:
 
 Savings are only calculated when `cost.total_cost` is present. Multiple currencies are never silently converted.
 
-### Current v0 savings assumptions
+### Current savings assumptions
 
 The dollar estimate is a scenario estimate attached to each candidate, not a measured future bill:
 
-- duplicate/repeated call: 100% of that call's observed cost
+- repeated tool/read candidate: not included in savings without stronger request/freshness evidence
+- context amplification candidate: not included in savings without payload evidence
+- duplicate/repeated model call: 100% of that call's observed cost
 - cache/reuse candidate: 70%
-- deterministic candidate: 80%
-- smaller-model candidate: 50%
+- deterministic candidate: 80–90% depending on evidence
 - orchestration-overhead candidate: 50%
+- smaller-model candidate: 50%
 
 If one call matches several rules, KORA Doctor uses only the largest ratio for that call; it never stacks savings estimates. These defaults are intentionally easy to inspect and change as real traces arrive.
 
@@ -122,6 +130,7 @@ AUDR upstream currently provides adapters for LiteLLM, Vercel AI SDK, Mastra, NV
 python3 -m kora_doctor audit samples/simple.jsonl
 python3 -m kora_doctor audit samples/multi_step.jsonl
 python3 -m kora_doctor audit samples/inefficient_agent.jsonl
+python3 -m kora_doctor audit samples/harness_waste.jsonl
 ```
 
 The samples are synthetic AUDR-compatible traces created for KORA Doctor. The inefficient trace is intentionally constructed to trigger multiple heuristics.
@@ -140,8 +149,9 @@ python3 -m unittest discover -s tests -v
 
 ## Limitations
 
-- No prompt/input fingerprints means duplicate and cache findings are heuristic.
-- Deterministic candidates are inferred from run names and labels only.
+- AUDR v1.0.0 does not include normalized tool arguments or prompt bodies, so repeated tool/read and duplicate-model findings remain candidates.
+- Context amplification can be observed from token growth, but AUDR alone cannot identify the exact carried payload.
+- Deterministic candidates are inferred from run names, labels, and reported usage only.
 - Smaller-model recommendations do not benchmark output quality.
 - Estimated savings are scenario estimates, not guaranteed savings.
 - KORA Doctor does not modify your agent or automatically reroute traffic in v0.

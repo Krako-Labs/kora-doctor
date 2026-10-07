@@ -2,12 +2,24 @@ from .model import AuditReport
 
 
 LABELS = {
-    "duplicate_repeated": "Duplicate/repeated calls",
-    "cache_reuse": "Cache/reuse candidates",
+    "repeated_tool_retrieval": "Repeated tool/read calls",
+    "context_amplification": "Context amplification",
     "deterministic_candidate": "Deterministic candidates",
-    "smaller_model_candidate": "Smaller-model candidates",
+    "duplicate_repeated": "Repeated model calls",
+    "cache_reuse": "Cross-run reuse candidates",
     "orchestration_overhead": "Orchestration overhead",
+    "smaller_model_candidate": "Smaller-model candidates",
 }
+
+DISPLAY_ORDER = (
+    "repeated_tool_retrieval",
+    "context_amplification",
+    "deterministic_candidate",
+    "duplicate_repeated",
+    "cache_reuse",
+    "orchestration_overhead",
+    "smaller_model_candidate",
+)
 
 
 def _money(value: float, currency: str) -> str:
@@ -19,7 +31,7 @@ def _money(value: float, currency: str) -> str:
 def render_text(report: AuditReport, top: int = 8) -> str:
     lines = []
     lines.append("KORA Doctor")
-    lines.append("Find the LLM calls your AI agent may never have needed.")
+    lines.append("Find execution waste in AI agent runs.")
     lines.append("")
     lines.append(
         f"Observed: {report.records} records · {report.runs} runs · "
@@ -38,25 +50,24 @@ def render_text(report: AuditReport, top: int = 8) -> str:
         lines.append("Observed cost:                 not reported")
 
     lines.append("")
-    lines.append("Candidates")
+    lines.append("Execution waste candidates")
     lines.append("-----------------------------------------------")
-    for key in (
-        "duplicate_repeated",
-        "cache_reuse",
-        "deterministic_candidate",
-        "smaller_model_candidate",
-        "orchestration_overhead",
-    ):
+    for key in DISPLAY_ORDER:
         lines.append(f"{LABELS[key]:31} {report.category_counts.get(key, 0):>4}")
 
     if report.findings:
         lines.append("")
         lines.append("Top findings")
         lines.append("-----------------------------------------------")
-        confidence_rank = {"medium": 0, "low": 1}
+        confidence_rank = {"high": 0, "medium": 1, "low": 2}
+        category_rank = {category: i for i, category in enumerate(DISPLAY_ORDER)}
         ranked = sorted(
             report.findings,
-            key=lambda f: (confidence_rank.get(f.confidence, 9), -len(f.record_ids), f.category),
+            key=lambda f: (
+                confidence_rank.get(f.confidence, 9),
+                category_rank.get(f.category, 99),
+                -len(f.record_ids),
+            ),
         )
         for finding in ranked[: max(0, top)]:
             lines.append(
@@ -73,5 +84,6 @@ def render_text(report: AuditReport, top: int = 8) -> str:
             lines.append(f"- {warning}")
 
     lines.append("")
-    lines.append("KORA Doctor reports heuristic candidates, not proof that a call was unnecessary.")
+    lines.append("Fix execution waste first. Downsize models second.")
+    lines.append("KORA Doctor reports candidates with evidence and confidence, not certainty.")
     return "\n".join(lines)
