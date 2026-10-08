@@ -74,6 +74,7 @@ KORA Doctor now prioritizes execution waste before model downsizing:
 
 - **Repeated tool/read calls** — the same AUDR tool/resource and operation repeating inside one run.
 - **Context amplification** — input-token growth that can indicate carried retrieval results, growing context, or repeated static tool definitions.
+- **Prompt cache efficiency** — observed cache-read share from AUDR cache counters, surfaced without assuming one universal 'good' threshold.
 - **Deterministic validation** — validation/schema/format work that may belong in JSON Schema, parsing, or ordinary code instead of an LLM.
 - **Repeated inference** — model/resource and usage signatures repeating inside a run.
 - **Cross-run reuse candidates** — similar signatures appearing across multiple runs.
@@ -112,6 +113,18 @@ The dollar estimate is a scenario estimate attached to each candidate, not a mea
 
 If one call matches several rules, KORA Doctor uses only the largest ratio for that call; it never stacks savings estimates. These defaults are intentionally easy to inspect and change as real traces arrive.
 
+## Prompt cache metrics
+
+When AUDR records include prompt-cache counters, KORA Doctor reports observed reuse directly:
+
+```text
+Prompt cache reuse: 0%  (0 read / 9,600 uncached; 3 calls)
+```
+
+`usage.llm.input_tokens` in AUDR v1.0.0 is uncached input and excludes cache reads. KORA Doctor therefore calculates cache-read share from `input_tokens + cache_read_tokens`.
+
+It does **not** hard-code a universal cache-hit target. A low reuse rate becomes more interesting when the same run also shows persistent high context or context amplification.
+
 ## AUDR compatibility
 
 KORA Doctor currently targets **AUDR v1.0.0** and accepts:
@@ -131,6 +144,7 @@ python3 -m kora_doctor audit samples/simple.jsonl
 python3 -m kora_doctor audit samples/multi_step.jsonl
 python3 -m kora_doctor audit samples/inefficient_agent.jsonl
 python3 -m kora_doctor audit samples/harness_waste.jsonl
+python3 -m kora_doctor audit samples/cache_instability.jsonl
 ```
 
 The samples are synthetic AUDR-compatible traces created for KORA Doctor. The inefficient trace is intentionally constructed to trigger multiple heuristics.
@@ -151,6 +165,7 @@ python3 -m unittest discover -s tests -v
 
 - AUDR v1.0.0 does not include normalized tool arguments or prompt bodies, so repeated tool/read and duplicate-model findings remain candidates.
 - Context amplification can be observed from token growth, but AUDR alone cannot identify the exact carried payload.
+- Prompt-cache metrics are only available when the adapter/provider reports `cache_read_tokens` / `cache_write_tokens`; KORA Doctor does not assume that missing cache telemetry means zero reuse.
 - Deterministic candidates are inferred from run names, labels, and reported usage only.
 - Smaller-model recommendations do not benchmark output quality.
 - Estimated savings are scenario estimates, not guaranteed savings.

@@ -104,6 +104,23 @@ def _input_tokens(record: Dict[str, Any]):
     return int(value) if isinstance(value, (int, float)) and value >= 0 else None
 
 
+def _cache_counters(record: Dict[str, Any]):
+    llm = record.get("usage", {}).get("llm", {})
+    if not isinstance(llm, dict):
+        return None
+    if "cache_read_tokens" not in llm and "cache_write_tokens" not in llm:
+        return None
+
+    def _counter(name: str) -> int:
+        value = llm.get(name)
+        return int(value) if isinstance(value, (int, float)) and value >= 0 else 0
+
+    input_tokens = _counter("input_tokens")
+    cache_read = _counter("cache_read_tokens")
+    cache_write = _counter("cache_write_tokens")
+    return input_tokens, cache_read, cache_write
+
+
 def _frontier_model(name: str) -> bool:
     value = (name or "").lower()
     if any(marker in value for marker in LOW_COST_MODEL_MARKERS):
@@ -144,6 +161,34 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
         warnings.append(
             "Multiple currencies detected. Costs and savings are reported separately and are never converted."
         )
+
+    cache_reported_calls = 0
+    cache_uncached_input_tokens = 0
+    cache_read_tokens = 0
+    cache_write_tokens = 0
+    for record in model_records:
+        counters = _cache_counters(record)
+        if counters is None:
+            continue
+        uncached, read, written = counters
+        cache_reported_calls += 1
+        cache_uncached_input_tokens += uncached
+        cache_read_tokens += read
+        cache_write_tokens += written
+
+    cache_denominator = cache_uncached_input_tokens + cache_read_tokens
+    cache_metrics = {}
+    if cache_reported_calls:
+        cache_metrics = {
+            "reported_calls": cache_reported_calls,
+            "uncached_input_tokens": cache_uncached_input_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_write_tokens": cache_write_tokens,
+            "read_share_percent": (
+                cache_read_tokens / cache_denominator * 100.0
+                if cache_denominator > 0 else 0.0
+            ),
+        }
 
     findings: List[Finding] = []
 
@@ -328,6 +373,33 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
                     )
                 )
 
+        cache_reported = []
+        for record in ordered:
+            counters = _cache_counters(record)
+            if counters is not None:
+                cache_reported.append((record, counters))
+
+        if len(cache_reported) >= 3:
+            total_uncached = sum(counters[0] for _, counters in cache_reported)
+            total_read = sum(counters[1] for _, counters in cache_reported)
+            if total_uncached >= 6000 and total_read == 0:
+                findings.append(
+                    Finding(
+                        category=CATEGORY_CONTEXT,
+                        title="No prompt-cache reads reported across high-context run",
+                        reason=(
+                            f"{len(cache_reported)} model calls explicitly reported cache telemetry, "
+                            f"with {total_uncached} uncached input tokens and zero cache-read tokens. "
+                            "If the prefix/context was stable, this is a strong cache-reuse opportunity; "
+                            "AUDR alone cannot prove prefix stability."
+                        ),
+                        confidence="low",
+                        record_ids=[str(record["record_id"]) for record, _ in cache_reported],
+                        run_ids=[run_id],
+                        saving_ratio=0.0,
+                    )
+                )
+
     # 6. Suspicious orchestration overhead.
     for run_id, group in by_run_models.items():
         ordered = _ordered(group)
@@ -415,4 +487,5 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
         findings=findings,
         category_counts=category_counts,
         warnings=warnings,
+        cache_metrics=cache_metrics,
     )

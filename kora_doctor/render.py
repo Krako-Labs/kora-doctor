@@ -49,6 +49,17 @@ def render_text(report: AuditReport, top: int = 8) -> str:
     else:
         lines.append("Observed cost:                 not reported")
 
+    if report.cache_metrics:
+        metrics = report.cache_metrics
+        reuse = metrics.get("read_share_percent", 0.0)
+        read = int(metrics.get("cache_read_tokens", 0))
+        uncached = int(metrics.get("uncached_input_tokens", 0))
+        calls = int(metrics.get("reported_calls", 0))
+        lines.append(
+            f"Prompt cache reuse:             {reuse:>11.0f}%  "
+            f"({read:,} read / {uncached:,} uncached; {calls} calls)"
+        )
+
     lines.append("")
     lines.append("Execution waste candidates")
     lines.append("-----------------------------------------------")
