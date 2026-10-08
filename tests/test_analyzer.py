@@ -45,6 +45,25 @@ class AnalyzerTests(unittest.TestCase):
         self.assertTrue(findings)
         self.assertTrue(all(finding.confidence == "low" for finding in findings))
 
+
+    def test_cache_metrics_are_reported_from_audr_counters(self):
+        report = analyze(load_records(str(ROOT / "samples/cache_instability.jsonl")))
+        self.assertEqual(report.cache_metrics["reported_calls"], 3)
+        self.assertEqual(report.cache_metrics["uncached_input_tokens"], 9600)
+        self.assertEqual(report.cache_metrics["cache_read_tokens"], 0)
+        self.assertEqual(report.cache_metrics["cache_write_tokens"], 3000)
+        self.assertEqual(report.cache_metrics["read_share_percent"], 0.0)
+
+    def test_zero_cache_reads_on_high_context_run_is_flagged_conservatively(self):
+        report = analyze(load_records(str(ROOT / "samples/cache_instability.jsonl")))
+        findings = [
+            finding for finding in report.findings
+            if finding.title == "No prompt-cache reads reported across high-context run"
+        ]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertEqual(findings[0].saving_ratio, 0.0)
+
     def test_savings_do_not_exceed_observed_cost(self):
         report = analyze(load_records(str(ROOT / "samples/inefficient_agent.jsonl")))
         self.assertLessEqual(report.potential_savings["USD"], report.observed_costs["USD"])

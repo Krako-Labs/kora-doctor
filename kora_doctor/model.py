@@ -35,6 +35,7 @@ class AuditReport:
     findings: List[Finding]
     category_counts: Dict[str, int]
     warnings: List[str]
+    cache_metrics: Dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, Any]:
         optimized = {
@@ -55,6 +56,7 @@ class AuditReport:
             "estimated_optimized_costs": optimized,
             "potential_savings_percent": percentages,
             "category_counts": self.category_counts,
+            "cache_metrics": self.cache_metrics,
             "findings": [f.as_dict() for f in self.findings],
             "warnings": self.warnings,
         }
