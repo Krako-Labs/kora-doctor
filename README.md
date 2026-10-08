@@ -38,6 +38,12 @@ Machine-readable output:
 kora-doctor audit audr.jsonl --json
 ```
 
+With an OTel sidecar:
+
+```bash
+kora-doctor audit samples/otel_audr.jsonl --otel samples/otel_sidecar.json
+```
+
 ## Example
 
 The v0.1.1 harness sample is synthetic and exists to exercise the heuristics. It is not a benchmark.
@@ -136,6 +142,28 @@ When the same tool repeats in one run:
 - same tool + different argument hashes -> **not** treated as a duplicate
 
 KORA Doctor never needs the raw tool payload for this check, and fingerprint-based findings still do not claim guaranteed savings because freshness and safety checks can make a repeat legitimate.
+
+## OTel sidecar enrichment
+
+KORA Doctor can combine portable AUDR cost/usage records with richer OpenTelemetry execution evidence:
+
+```bash
+kora-doctor audit audr.jsonl --otel trace.json
+```
+
+The sidecar accepts standard OTLP JSON `resourceSpans -> scopeSpans -> spans` as well as simpler JSON span arrays.
+
+When matching spans are found by `span_id` / `trace_id`, KORA Doctor can enrich the AUDR record with:
+
+- SHA-256 fingerprints of `gen_ai.tool.call.arguments`
+- SHA-256 fingerprints of `gen_ai.tool.call.result`
+- OTel span status as per-operation status
+- optional retry / consumption / planning attributes when present
+- inferred retry lineage when the same hashed tool call follows an explicit failed/timeout/unknown span
+
+Raw tool arguments and results are hashed in memory and are not copied into the KORA Doctor report.
+
+This keeps AUDR as the portable usage/cost layer while letting OTel/traceAI provide stronger execution evidence.
 
 ## Optional dead-work evidence
 

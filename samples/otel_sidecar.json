@@ -1,0 +1,68 @@
+{
+  "resourceSpans": [
+    {
+      "scopeSpans": [
+        {
+          "spans": [
+            {
+              "traceId": "0123456789abcdef0123456789abcdef",
+              "spanId": "00000000000000a1",
+              "name": "lookup_customer",
+              "attributes": [
+                {
+                  "key": "gen_ai.tool.name",
+                  "value": {
+                    "stringValue": "lookup_customer"
+                  }
+                },
+                {
+                  "key": "gen_ai.tool.call.arguments",
+                  "value": {
+                    "stringValue": "{\"customer_id\":42}"
+                  }
+                },
+                {
+                  "key": "gen_ai.tool.call.result",
+                  "value": {
+                    "stringValue": "{\"name\":\"Ada\"}"
+                  }
+                }
+              ],
+              "status": {
+                "code": "STATUS_CODE_ERROR"
+              }
+            },
+            {
+              "traceId": "0123456789abcdef0123456789abcdef",
+              "spanId": "00000000000000a2",
+              "name": "lookup_customer",
+              "attributes": [
+                {
+                  "key": "gen_ai.tool.name",
+                  "value": {
+                    "stringValue": "lookup_customer"
+                  }
+                },
+                {
+                  "key": "gen_ai.tool.call.arguments",
+                  "value": {
+                    "stringValue": "{ \"customer_id\": 42 }"
+                  }
+                },
+                {
+                  "key": "gen_ai.tool.call.result",
+                  "value": {
+                    "stringValue": "{\"name\":\"Ada\"}"
+                  }
+                }
+              ],
+              "status": {
+                "code": "STATUS_CODE_OK"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
