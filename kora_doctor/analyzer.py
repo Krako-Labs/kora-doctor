@@ -7,6 +7,7 @@ from .model import AuditReport, Finding
 
 CATEGORY_REPEATED_TOOL = "repeated_tool_retrieval"
 CATEGORY_RETRY = "retry_overhead"
+CATEGORY_UNUSED = "unused_work"
 CATEGORY_CONTEXT = "context_amplification"
 CATEGORY_DUPLICATE = "duplicate_repeated"
 CATEGORY_CACHE = "cache_reuse"
@@ -60,6 +61,28 @@ OPERATION_STATUS_LABELS = (
     "operation_status",
     "tool_status",
     "kora.operation_status",
+)
+
+OUTPUT_CONSUMED_LABELS = (
+    "output_consumed",
+    "kora.output_consumed",
+)
+
+STEP_ROLE_LABELS = (
+    "step_role",
+    "kora.step_role",
+)
+
+PLANNED_STEP_COUNT_LABELS = (
+    "planned_step_count",
+    "planned_steps",
+    "kora.planned_step_count",
+)
+
+EXECUTED_STEP_COUNT_LABELS = (
+    "executed_step_count",
+    "executed_steps",
+    "kora.executed_step_count",
 )
 
 RETRY_PROBLEM_STATUSES = {"failed", "timeout", "unknown"}
@@ -148,6 +171,46 @@ def _retry_attempt(record: Dict[str, Any]):
 def _operation_status(record: Dict[str, Any]):
     value = _label_fingerprint(record, OPERATION_STATUS_LABELS)
     return value.lower() if isinstance(value, str) else None
+
+
+def _label_bool(record: Dict[str, Any], names: Tuple[str, ...]):
+    value = _label_fingerprint(record, names)
+    if value is None:
+        return None
+    lowered = value.lower()
+    if lowered in {"true", "1", "yes"}:
+        return True
+    if lowered in {"false", "0", "no"}:
+        return False
+    return None
+
+
+def _label_int(record: Dict[str, Any], names: Tuple[str, ...]):
+    value = _label_fingerprint(record, names)
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _output_consumed(record: Dict[str, Any]):
+    return _label_bool(record, OUTPUT_CONSUMED_LABELS)
+
+
+def _step_role(record: Dict[str, Any]):
+    value = _label_fingerprint(record, STEP_ROLE_LABELS)
+    return value.lower() if isinstance(value, str) else None
+
+
+def _planned_step_count(record: Dict[str, Any]):
+    return _label_int(record, PLANNED_STEP_COUNT_LABELS)
+
+
+def _executed_step_count(record: Dict[str, Any]):
+    return _label_int(record, EXECUTED_STEP_COUNT_LABELS)
 
 
 def _context_text(record: Dict[str, Any]) -> str:
@@ -461,6 +524,51 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
             )
         )
 
+    # 3. Explicit unused-output / dead-planning evidence.
+    for record in records:
+        consumed = _output_consumed(record)
+        role = _step_role(record)
+        planned = _planned_step_count(record)
+        executed = _executed_step_count(record)
+
+        if role == "planner" and planned is not None and executed is not None and planned > executed:
+            dead = planned - executed
+            detail = (
+                f"The planner explicitly reports {planned} planned steps but only {executed} executed "
+                f"steps, leaving {dead} planned step(s) unexecuted."
+            )
+            if consumed is False:
+                detail += " The planner output is also explicitly marked unconsumed."
+            findings.append(
+                Finding(
+                    category=CATEGORY_UNUSED,
+                    title=f"Planner produced {dead} unexecuted step(s)",
+                    reason=detail,
+                    confidence="medium",
+                    record_ids=[str(record["record_id"])],
+                    run_ids=[str(record["run"]["run_id"])],
+                    saving_ratio=0.0,
+                )
+            )
+            continue
+
+        if consumed is False:
+            findings.append(
+                Finding(
+                    category=CATEGORY_UNUSED,
+                    title="Output explicitly marked unconsumed",
+                    reason=(
+                        "The trace source explicitly marks this operation's output as not consumed by "
+                        "downstream execution. KORA Doctor reports it as dead-work evidence without "
+                        "inferring from timing or span order."
+                    ),
+                    confidence="medium",
+                    record_ids=[str(record["record_id"])],
+                    run_ids=[str(record["run"]["run_id"])],
+                    saving_ratio=0.0,
+                )
+            )
+
     # 2. Model calls with identical usage/resource signatures in one run.
     by_run_signature = defaultdict(list)
     for record in model_records:
@@ -711,6 +819,7 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
     category_counts = {
         CATEGORY_REPEATED_TOOL: len(category_record_ids[CATEGORY_REPEATED_TOOL]),
         CATEGORY_RETRY: len(category_record_ids[CATEGORY_RETRY]),
+        CATEGORY_UNUSED: len(category_record_ids[CATEGORY_UNUSED]),
         CATEGORY_CONTEXT: len(category_record_ids[CATEGORY_CONTEXT]),
         CATEGORY_DETERMINISTIC: len(category_record_ids[CATEGORY_DETERMINISTIC]),
         CATEGORY_DUPLICATE: len(category_record_ids[CATEGORY_DUPLICATE]),

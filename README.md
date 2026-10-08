@@ -137,6 +137,30 @@ When the same tool repeats in one run:
 
 KORA Doctor never needs the raw tool payload for this check, and fingerprint-based findings still do not claim guaranteed savings because freshness and safety checks can make a repeat legitimate.
 
+## Optional dead-work evidence
+
+KORA Doctor does not infer unused outputs from timing alone. Richer trace sources can provide explicit downstream-consumption evidence:
+
+```json
+{
+  "attribution": {
+    "labels": {
+      "output_consumed": "false",
+      "step_role": "planner",
+      "planned_step_count": "5",
+      "executed_step_count": "2"
+    }
+  }
+}
+```
+
+This enables two conservative findings:
+
+- outputs explicitly marked as unconsumed
+- planners that explicitly report more planned steps than executed steps
+
+These findings stay out of savings estimates until a real replay/evaluation proves the work can be removed safely.
+
 ## Optional retry lineage
 
 AUDR v1.0.0 has run-level errors and outcomes, but not per-operation retry lineage. Richer trace sources can preserve retry evidence in `attribution.labels`:
@@ -192,6 +216,7 @@ python3 -m kora_doctor audit samples/harness_waste.jsonl
 python3 -m kora_doctor audit samples/cache_instability.jsonl
 python3 -m kora_doctor audit samples/tool_fingerprints.jsonl
 python3 -m kora_doctor audit samples/retry_lineage.jsonl
+python3 -m kora_doctor audit samples/unused_work.jsonl
 ```
 
 The samples are synthetic AUDR-compatible traces created for KORA Doctor. The inefficient trace is intentionally constructed to trigger multiple heuristics.

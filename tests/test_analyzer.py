@@ -115,6 +115,20 @@ class AnalyzerTests(unittest.TestCase):
         }
         self.assertIn("01KD6000000000000000000002", retry_ids)
 
+
+    def test_explicit_dead_planning_and_unconsumed_output_are_detected(self):
+        report = analyze(load_records(str(ROOT / "samples/unused_work.jsonl")))
+        findings = [
+            finding for finding in report.findings
+            if finding.category == "unused_work"
+        ]
+        self.assertEqual(len(findings), 2)
+        titles = {finding.title for finding in findings}
+        self.assertIn("Planner produced 3 unexecuted step(s)", titles)
+        self.assertIn("Output explicitly marked unconsumed", titles)
+        self.assertTrue(all(finding.confidence == "medium" for finding in findings))
+        self.assertTrue(all(finding.saving_ratio == 0.0 for finding in findings))
+
     def test_savings_do_not_exceed_observed_cost(self):
         report = analyze(load_records(str(ROOT / "samples/inefficient_agent.jsonl")))
         self.assertLessEqual(report.potential_savings["USD"], report.observed_costs["USD"])
