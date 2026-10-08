@@ -137,6 +137,27 @@ When the same tool repeats in one run:
 
 KORA Doctor never needs the raw tool payload for this check, and fingerprint-based findings still do not claim guaranteed savings because freshness and safety checks can make a repeat legitimate.
 
+## Optional retry lineage
+
+AUDR v1.0.0 has run-level errors and outcomes, but not per-operation retry lineage. Richer trace sources can preserve retry evidence in `attribution.labels`:
+
+```json
+{
+  "attribution": {
+    "labels": {
+      "tool_args_hash": "sha256:...",
+      "retry_of": "01KD...",
+      "retry_attempt": "2",
+      "operation_status": "timeout"
+    }
+  }
+}
+```
+
+KORA Doctor resolves `retry_of` against either a prior `record_id` or `span_id`. Confidence increases when retry lineage, matching argument fingerprints, and prior per-operation status all agree.
+
+A retry is reported as overhead evidence, not automatically as removable waste. Timeouts, idempotency, and unknown remote outcomes can make a retry necessary.
+
 ## Prompt cache metrics
 
 When AUDR records include prompt-cache counters, KORA Doctor reports observed reuse directly:
@@ -170,6 +191,7 @@ python3 -m kora_doctor audit samples/inefficient_agent.jsonl
 python3 -m kora_doctor audit samples/harness_waste.jsonl
 python3 -m kora_doctor audit samples/cache_instability.jsonl
 python3 -m kora_doctor audit samples/tool_fingerprints.jsonl
+python3 -m kora_doctor audit samples/retry_lineage.jsonl
 ```
 
 The samples are synthetic AUDR-compatible traces created for KORA Doctor. The inefficient trace is intentionally constructed to trigger multiple heuristics.
