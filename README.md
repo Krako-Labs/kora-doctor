@@ -113,6 +113,30 @@ The dollar estimate is a scenario estimate attached to each candidate, not a mea
 
 If one call matches several rules, KORA Doctor uses only the largest ratio for that call; it never stacks savings estimates. These defaults are intentionally easy to inspect and change as real traces arrive.
 
+## Optional tool fingerprints
+
+AUDR intentionally avoids raw tool arguments and results. KORA Doctor can still use privacy-preserving fingerprints when a trace source places hashes in `attribution.labels`:
+
+```json
+{
+  "attribution": {
+    "labels": {
+      "tool_args_hash": "sha256:...",
+      "tool_result_hash": "sha256:..."
+    }
+  }
+}
+```
+
+When the same tool repeats in one run:
+
+- same tool, no fingerprint -> low-confidence repeat candidate
+- same tool + same `tool_args_hash` -> medium-confidence same-argument repeat
+- same tool + same args hash + same `tool_result_hash` -> medium-confidence exact repeated-work evidence
+- same tool + different argument hashes -> **not** treated as a duplicate
+
+KORA Doctor never needs the raw tool payload for this check, and fingerprint-based findings still do not claim guaranteed savings because freshness and safety checks can make a repeat legitimate.
+
 ## Prompt cache metrics
 
 When AUDR records include prompt-cache counters, KORA Doctor reports observed reuse directly:
@@ -145,6 +169,7 @@ python3 -m kora_doctor audit samples/multi_step.jsonl
 python3 -m kora_doctor audit samples/inefficient_agent.jsonl
 python3 -m kora_doctor audit samples/harness_waste.jsonl
 python3 -m kora_doctor audit samples/cache_instability.jsonl
+python3 -m kora_doctor audit samples/tool_fingerprints.jsonl
 ```
 
 The samples are synthetic AUDR-compatible traces created for KORA Doctor. The inefficient trace is intentionally constructed to trigger multiple heuristics.

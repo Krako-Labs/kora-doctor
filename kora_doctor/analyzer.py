@@ -30,6 +30,21 @@ FRONTIER_MODEL_PATTERNS = (
 LOW_COST_MODEL_MARKERS = ("mini", "nano", "haiku", "flash", "small")
 
 
+TOOL_ARGS_HASH_LABELS = (
+    "tool_args_hash",
+    "kora.tool_args_hash",
+    "args_hash",
+    "input_hash",
+)
+
+TOOL_RESULT_HASH_LABELS = (
+    "tool_result_hash",
+    "kora.tool_result_hash",
+    "result_hash",
+    "output_hash",
+)
+
+
 def _is_model(record: Dict[str, Any]) -> bool:
     resource = record.get("resource", {})
     return resource.get("type") == "model" or "llm" in record.get("usage", {})
@@ -73,6 +88,25 @@ def _tool_signature(record: Dict[str, Any]) -> Tuple[Any, ...]:
         resource.get("modality"),
         tool.get("type"),
     )
+
+
+def _label_fingerprint(record: Dict[str, Any], names: Tuple[str, ...]):
+    labels = record.get("attribution", {}).get("labels") or {}
+    if not isinstance(labels, dict):
+        return None
+    for name in names:
+        value = labels.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _tool_args_hash(record: Dict[str, Any]):
+    return _label_fingerprint(record, TOOL_ARGS_HASH_LABELS)
+
+
+def _tool_result_hash(record: Dict[str, Any]):
+    return _label_fingerprint(record, TOOL_RESULT_HASH_LABELS)
 
 
 def _context_text(record: Dict[str, Any]) -> str:
@@ -193,32 +227,112 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
     findings: List[Finding] = []
 
     # 1. Repeated tool/resource use inside one run.
-    # AUDR v1.0.0 does not carry normalized tool arguments, so this is observed
-    # repetition of the same resource/operation, not proof of identical requests.
+    #
+    # AUDR intentionally does not include tool arguments/results. When a trace
+    # source supplies privacy-preserving hashes in attribution.labels, use those
+    # as stronger evidence. Otherwise keep the old resource-only heuristic.
     by_run_tool = defaultdict(list)
     for record in tool_records:
         run_id = str(record["run"]["run_id"])
         by_run_tool[(run_id, _tool_signature(record))].append(record)
 
-    for (run_id, signature), group in by_run_tool.items():
-        if len(group) >= 2:
-            duplicates = _ordered(group)[1:]
-            resource_name = str(group[0].get("resource", {}).get("name", "tool"))
-            findings.append(
-                Finding(
-                    category=CATEGORY_REPEATED_TOOL,
-                    title=f"{len(duplicates)} repeated tool/read call(s): {resource_name}",
-                    reason=(
-                        "The same AUDR tool/resource and operation repeated within one run. "
-                        "AUDR v1.0.0 does not include normalized tool arguments, so this is an observed "
-                        "repeat and a reuse candidate, not proof that the second call was unnecessary."
-                    ),
-                    confidence="low",
-                    record_ids=[str(r["record_id"]) for r in duplicates],
-                    run_ids=[run_id],
-                    saving_ratio=0.0,
+    for (run_id, _), group in by_run_tool.items():
+        if len(group) < 2:
+            continue
+
+        ordered = _ordered(group)
+        resource_name = str(ordered[0].get("resource", {}).get("name", "tool"))
+
+        by_args_hash = defaultdict(list)
+        without_args_hash = []
+        for record in ordered:
+            args_hash = _tool_args_hash(record)
+            if args_hash:
+                by_args_hash[args_hash].append(record)
+            else:
+                without_args_hash.append(record)
+
+        exact_groups = [records for records in by_args_hash.values() if len(records) >= 2]
+        if exact_groups:
+            for exact_group in exact_groups:
+                duplicates = exact_group[1:]
+                result_hashes = [_tool_result_hash(record) for record in exact_group]
+                nonempty_results = [value for value in result_hashes if value]
+                same_result = (
+                    len(nonempty_results) == len(exact_group)
+                    and len(set(nonempty_results)) == 1
                 )
+
+                if same_result:
+                    title = f"{len(duplicates)} exact repeated tool call(s): {resource_name}"
+                    reason = (
+                        "The same tool/resource repeated in one run with the same argument fingerprint "
+                        "and the same result fingerprint. This is strong evidence of repeated work, "
+                        "though freshness or safety checks may still justify the second call."
+                    )
+                else:
+                    title = f"{len(duplicates)} same-argument tool call(s): {resource_name}"
+                    reason = (
+                        "The same tool/resource repeated in one run with the same argument fingerprint. "
+                        "This is stronger evidence than a resource-name match alone, but changing external "
+                        "state can still make a repeated read legitimate."
+                    )
+
+                findings.append(
+                    Finding(
+                        category=CATEGORY_REPEATED_TOOL,
+                        title=title,
+                        reason=reason,
+                        confidence="medium",
+                        record_ids=[str(record["record_id"]) for record in duplicates],
+                        run_ids=[run_id],
+                        saving_ratio=0.0,
+                    )
+                )
+
+            # Hashes were available, so do not downgrade distinct hashed calls
+            # into a generic duplicate merely because they used the same tool.
+            if len(without_args_hash) >= 2:
+                duplicates = without_args_hash[1:]
+                findings.append(
+                    Finding(
+                        category=CATEGORY_REPEATED_TOOL,
+                        title=f"{len(duplicates)} unverified repeated tool/read call(s): {resource_name}",
+                        reason=(
+                            "The same tool/resource repeated, but these calls did not carry an argument "
+                            "fingerprint. They remain low-confidence reuse candidates."
+                        ),
+                        confidence="low",
+                        record_ids=[str(record["record_id"]) for record in duplicates],
+                        run_ids=[run_id],
+                        saving_ratio=0.0,
+                    )
+                )
+            continue
+
+        # No repeated argument fingerprint was available. If hashes exist but
+        # are all distinct, that is evidence these were different requests and
+        # we should not flag them as duplicates.
+        hashed = [record for record in ordered if _tool_args_hash(record)]
+        if hashed and not without_args_hash:
+            continue
+
+        duplicates = ordered[1:]
+        findings.append(
+            Finding(
+                category=CATEGORY_REPEATED_TOOL,
+                title=f"{len(duplicates)} repeated tool/read call(s): {resource_name}",
+                reason=(
+                    "The same AUDR tool/resource and operation repeated within one run. "
+                    "No repeated argument fingerprint was available, so this is an observed "
+                    "repeat and a reuse candidate, not proof that the second call was unnecessary."
+                ),
+                confidence="low",
+                record_ids=[str(record["record_id"]) for record in duplicates],
+                run_ids=[run_id],
+                saving_ratio=0.0,
             )
+        )
 
     # 2. Model calls with identical usage/resource signatures in one run.
     by_run_signature = defaultdict(list)

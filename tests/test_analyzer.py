@@ -64,6 +64,35 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(findings[0].confidence, "low")
         self.assertEqual(findings[0].saving_ratio, 0.0)
 
+
+    def test_matching_tool_fingerprints_raise_repeat_confidence(self):
+        report = analyze(load_records(str(ROOT / "samples/tool_fingerprints.jsonl")))
+        findings = [
+            finding for finding in report.findings
+            if finding.category == "repeated_tool_retrieval"
+        ]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "medium")
+        self.assertIn("exact repeated tool call", findings[0].title)
+        self.assertEqual(len(findings[0].record_ids), 1)
+
+    def test_distinct_argument_fingerprints_are_not_called_duplicates(self):
+        report = analyze(load_records(str(ROOT / "tests/fixtures/tool_fingerprints_distinct.jsonl")))
+        findings = [
+            finding for finding in report.findings
+            if finding.category == "repeated_tool_retrieval"
+        ]
+        self.assertEqual(findings, [])
+
+    def test_fingerprint_findings_do_not_claim_savings(self):
+        report = analyze(load_records(str(ROOT / "samples/tool_fingerprints.jsonl")))
+        findings = [
+            finding for finding in report.findings
+            if finding.category == "repeated_tool_retrieval"
+        ]
+        self.assertTrue(findings)
+        self.assertTrue(all(finding.saving_ratio == 0.0 for finding in findings))
+
     def test_savings_do_not_exceed_observed_cost(self):
         report = analyze(load_records(str(ROOT / "samples/inefficient_agent.jsonl")))
         self.assertLessEqual(report.potential_savings["USD"], report.observed_costs["USD"])
