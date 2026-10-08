@@ -6,6 +6,7 @@ from .model import AuditReport, Finding
 
 
 CATEGORY_REPEATED_TOOL = "repeated_tool_retrieval"
+CATEGORY_RETRY = "retry_overhead"
 CATEGORY_CONTEXT = "context_amplification"
 CATEGORY_DUPLICATE = "duplicate_repeated"
 CATEGORY_CACHE = "cache_reuse"
@@ -43,6 +44,26 @@ TOOL_RESULT_HASH_LABELS = (
     "result_hash",
     "output_hash",
 )
+
+
+RETRY_OF_LABELS = (
+    "retry_of",
+    "kora.retry_of",
+)
+
+RETRY_ATTEMPT_LABELS = (
+    "retry_attempt",
+    "kora.retry_attempt",
+)
+
+OPERATION_STATUS_LABELS = (
+    "operation_status",
+    "tool_status",
+    "kora.operation_status",
+)
+
+RETRY_PROBLEM_STATUSES = {"failed", "timeout", "unknown"}
+RETRY_SUCCESS_STATUSES = {"success", "succeeded", "ok"}
 
 
 def _is_model(record: Dict[str, Any]) -> bool:
@@ -107,6 +128,26 @@ def _tool_args_hash(record: Dict[str, Any]):
 
 def _tool_result_hash(record: Dict[str, Any]):
     return _label_fingerprint(record, TOOL_RESULT_HASH_LABELS)
+
+
+def _retry_of(record: Dict[str, Any]):
+    return _label_fingerprint(record, RETRY_OF_LABELS)
+
+
+def _retry_attempt(record: Dict[str, Any]):
+    value = _label_fingerprint(record, RETRY_ATTEMPT_LABELS)
+    if value is None:
+        return None
+    try:
+        attempt = int(value)
+    except (TypeError, ValueError):
+        return None
+    return attempt if attempt >= 1 else None
+
+
+def _operation_status(record: Dict[str, Any]):
+    value = _label_fingerprint(record, OPERATION_STATUS_LABELS)
+    return value.lower() if isinstance(value, str) else None
 
 
 def _context_text(record: Dict[str, Any]) -> str:
@@ -330,6 +371,92 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
                 confidence="low",
                 record_ids=[str(record["record_id"]) for record in duplicates],
                 run_ids=[run_id],
+                saving_ratio=0.0,
+            )
+        )
+
+    # 2. Explicit retry lineage.
+    #
+    # AUDR v1.0.0 has run-level error/outcome fields but no per-operation retry
+    # lineage. Richer trace sources can preserve that evidence in labels.
+    record_by_record_id = {str(record.get("record_id")): record for record in records}
+    record_by_span_id = {
+        str(record.get("run", {}).get("span_id")): record
+        for record in records
+        if record.get("run", {}).get("span_id")
+    }
+
+    for record in records:
+        retry_ref = _retry_of(record)
+        attempt = _retry_attempt(record)
+        if not retry_ref and not (attempt is not None and attempt > 1):
+            continue
+
+        previous = None
+        if retry_ref:
+            previous = record_by_record_id.get(retry_ref) or record_by_span_id.get(retry_ref)
+
+        if previous is None:
+            findings.append(
+                Finding(
+                    category=CATEGORY_RETRY,
+                    title="Retry attempt observed without resolvable prior operation",
+                    reason=(
+                        "Retry metadata indicates a repeated attempt, but the referenced prior operation "
+                        "is not present in this trace. This is retry overhead evidence, not proof of waste."
+                    ),
+                    confidence="low",
+                    record_ids=[str(record["record_id"])],
+                    run_ids=[str(record["run"]["run_id"])],
+                    saving_ratio=0.0,
+                )
+            )
+            continue
+
+        same_tool = _tool_signature(previous) == _tool_signature(record)
+        prev_args = _tool_args_hash(previous)
+        curr_args = _tool_args_hash(record)
+        same_args = bool(prev_args and curr_args and prev_args == curr_args)
+        prev_status = _operation_status(previous)
+
+        confidence = "low"
+        if same_tool and same_args and prev_status in RETRY_PROBLEM_STATUSES:
+            confidence = "medium"
+            title = "Retry replayed the same failed/unknown tool call"
+            reason = (
+                f"The retry references a prior {prev_status} operation with the same tool and argument "
+                "fingerprint. This is explicit retry overhead; whether the retry was necessary depends "
+                "on the failure mode and idempotency."
+            )
+        elif same_tool and same_args and prev_status in RETRY_SUCCESS_STATUSES:
+            confidence = "medium"
+            title = "Retry repeated a previously successful tool call"
+            reason = (
+                "The retry references a prior successful operation with the same tool and argument "
+                "fingerprint. This is a strong candidate for avoidable duplicate work, but KORA Doctor "
+                "does not assume the external state stayed unchanged."
+            )
+        elif same_tool and same_args:
+            title = "Retry repeated the same tool arguments"
+            reason = (
+                "Explicit retry lineage points to a prior operation with the same tool and argument "
+                "fingerprint, but the prior per-operation status is missing."
+            )
+        else:
+            title = "Retry attempt observed"
+            reason = (
+                "Explicit retry lineage is present, but KORA Doctor lacks matching argument/status "
+                "evidence to call the retried work redundant."
+            )
+
+        findings.append(
+            Finding(
+                category=CATEGORY_RETRY,
+                title=title,
+                reason=reason,
+                confidence=confidence,
+                record_ids=[str(record["record_id"])],
+                run_ids=[str(record["run"]["run_id"])],
                 saving_ratio=0.0,
             )
         )
@@ -583,6 +710,7 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
 
     category_counts = {
         CATEGORY_REPEATED_TOOL: len(category_record_ids[CATEGORY_REPEATED_TOOL]),
+        CATEGORY_RETRY: len(category_record_ids[CATEGORY_RETRY]),
         CATEGORY_CONTEXT: len(category_record_ids[CATEGORY_CONTEXT]),
         CATEGORY_DETERMINISTIC: len(category_record_ids[CATEGORY_DETERMINISTIC]),
         CATEGORY_DUPLICATE: len(category_record_ids[CATEGORY_DUPLICATE]),

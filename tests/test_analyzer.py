@@ -93,6 +93,28 @@ class AnalyzerTests(unittest.TestCase):
         self.assertTrue(findings)
         self.assertTrue(all(finding.saving_ratio == 0.0 for finding in findings))
 
+
+    def test_explicit_retry_lineage_with_same_args_is_detected(self):
+        report = analyze(load_records(str(ROOT / "samples/retry_lineage.jsonl")))
+        findings = [
+            finding for finding in report.findings
+            if finding.category == "retry_overhead"
+        ]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "medium")
+        self.assertIn("same failed/unknown tool call", findings[0].title)
+        self.assertEqual(findings[0].saving_ratio, 0.0)
+
+    def test_retry_lineage_is_separate_from_plain_repeat_detection(self):
+        report = analyze(load_records(str(ROOT / "samples/retry_lineage.jsonl")))
+        retry_ids = {
+            rid
+            for finding in report.findings
+            if finding.category == "retry_overhead"
+            for rid in finding.record_ids
+        }
+        self.assertIn("01KD6000000000000000000002", retry_ids)
+
     def test_savings_do_not_exceed_observed_cost(self):
         report = analyze(load_records(str(ROOT / "samples/inefficient_agent.jsonl")))
         self.assertLessEqual(report.potential_savings["USD"], report.observed_costs["USD"])
