@@ -4,6 +4,7 @@ import sys
 
 from . import __version__
 from .analyzer import analyze
+from .otel import enrich_with_otel
 from .parser import InputError, load_records
 from .render import render_text
 
@@ -11,13 +12,17 @@ from .render import render_text
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="kora-doctor",
-        description="Find the LLM calls your AI agent may never have needed.",
+        description="Find execution waste in AI agent runs.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command")
 
     audit = sub.add_parser("audit", help="Analyze an AUDR JSON/JSONL file")
     audit.add_argument("input", help="Path to AUDR JSON, JSON array, or JSONL")
+    audit.add_argument(
+        "--otel",
+        help="Optional OTLP/OTel JSON sidecar used to enrich AUDR records with execution evidence",
+    )
     audit.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     audit.add_argument("--top", type=int, default=8, help="Number of findings to show (default: 8)")
     return parser
@@ -33,7 +38,18 @@ def main(argv=None) -> int:
 
     try:
         records = load_records(args.input)
+        otel_stats = None
+        if args.otel:
+            records, otel_stats = enrich_with_otel(records, args.otel)
         report = analyze(records)
+        if otel_stats is not None:
+            report.warnings.append(
+                "OTel enrichment: "
+                f"{otel_stats['matched']}/{otel_stats['spans']} spans matched; "
+                f"{otel_stats['args_hashed']} arg fingerprint(s); "
+                f"{otel_stats['statuses']} status signal(s); "
+                f"{otel_stats['inferred_retries']} retry link(s) inferred."
+            )
     except (InputError, OSError) as exc:
         print(f"kora-doctor: error: {exc}", file=sys.stderr)
         return 2
