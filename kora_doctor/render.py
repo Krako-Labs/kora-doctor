@@ -4,6 +4,7 @@ from .model import AuditReport
 LABELS = {
     "repeated_tool_retrieval": "Repeated tool/read calls",
     "retry_overhead": "Retry overhead",
+    "unused_work": "Unused/dead work",
     "context_amplification": "Context amplification",
     "deterministic_candidate": "Deterministic candidates",
     "duplicate_repeated": "Repeated model calls",
@@ -15,6 +16,7 @@ LABELS = {
 DISPLAY_ORDER = (
     "repeated_tool_retrieval",
     "retry_overhead",
+    "unused_work",
     "context_amplification",
     "deterministic_candidate",
     "duplicate_repeated",
