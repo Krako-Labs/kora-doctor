@@ -169,6 +169,31 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(report.category_counts["replanning_loop"], 1)
         self.assertEqual(findings[0].saving_ratio, 0)
 
+    def test_freshness_flags_only_observed_consecutive_same_snapshots(self):
+        records = load_records(str(ROOT / "samples/freshness_refresh.jsonl"))
+        report = analyze(records)
+        findings = [f for f in report.findings if f.category == "freshness_refresh"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(len(findings[0].record_ids), 3)
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertEqual(findings[0].saving_ratio, 0)
+        self.assertEqual(report.category_counts["freshness_refresh"], 3)
+
+    def test_freshness_rejects_missing_evidence_and_distinct_source(self):
+        import copy
+        records = load_records(str(ROOT / "samples/freshness_refresh.jsonl"))
+        records[1]["attribution"]["labels"]["source_id_hash"] = "other-source"
+        records[2]["attribution"]["labels"].pop("source_snapshot_hash")
+        report = analyze(records)
+        self.assertEqual(report.category_counts["freshness_refresh"], 0)
+
+    def test_freshness_is_not_model_cost_savings(self):
+        records = load_records(str(ROOT / "samples/freshness_refresh.jsonl"))
+        report = analyze(records)
+        for finding in report.findings:
+            if finding.category == "freshness_refresh":
+                self.assertEqual(finding.saving_ratio, 0)
+
     def test_savings_do_not_exceed_observed_cost(self):
         report = analyze(load_records(str(ROOT / "samples/inefficient_agent.jsonl")))
         self.assertLessEqual(report.potential_savings["USD"], report.observed_costs["USD"])

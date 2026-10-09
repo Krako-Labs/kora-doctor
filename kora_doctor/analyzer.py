@@ -1,4 +1,5 @@
 import re
+from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Any, Dict, List, Tuple
 
@@ -15,6 +16,7 @@ CATEGORY_DETERMINISTIC = "deterministic_candidate"
 CATEGORY_SMALLER = "smaller_model_candidate"
 CATEGORY_ORCHESTRATION = "orchestration_overhead"
 CATEGORY_REPLANNING = "replanning_loop"
+CATEGORY_FRESHNESS = "freshness_refresh"
 
 DETERMINISTIC_KEYWORDS = (
     "classif", "route", "routing", "validat", "schema", "format",
@@ -78,6 +80,10 @@ NEXT_ACTION_BEFORE_HASH_LABELS = ("next_action_before_hash", "kora.next_action_b
 NEXT_ACTION_AFTER_HASH_LABELS = ("next_action_after_hash", "kora.next_action_after_hash")
 NONEMPTY_RESULT_LABELS = ("nonempty_result", "kora.nonempty_result")
 EXPECTED_REPEAT_LABELS = ("expected_repeat", "kora.expected_repeat")
+
+SOURCE_ID_LABELS = ("source_id_hash", "kora.source_id_hash")
+SOURCE_SNAPSHOT_LABELS = ("source_snapshot_hash", "kora.source_snapshot_hash")
+SOURCE_REFRESH_LABELS = ("source_refresh", "kora.source_refresh")
 
 STEP_ROLE_LABELS = (
     "step_role",
@@ -294,6 +300,19 @@ def _ordered(group: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             str(r.get("timing", {}).get("event_time", "")),
         ),
     )
+
+
+def _parsed_event_time(record: Dict[str, Any]):
+    value = record.get("timing", {}).get("event_time")
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        return None
 
 
 def analyze(records: List[Dict[str, Any]]) -> AuditReport:
@@ -571,6 +590,48 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
                 confidence="medium" if same_plan and same_next else "low",
                 record_ids=[str(record["record_id"])],
                 run_ids=[str(record["run"]["run_id"])],
+                saving_ratio=0.0,
+            )
+        )
+
+    # Snapshot fingerprints permit observed unchanged-refresh evidence, not
+    # an inferred TTL, missed changes, or a claim of removable calls.
+    snapshots = defaultdict(list)
+    for record in records:
+        if _label_bool(record, SOURCE_REFRESH_LABELS) is not True:
+            continue
+        source = _label_fingerprint(record, SOURCE_ID_LABELS)
+        digest = _label_fingerprint(record, SOURCE_SNAPSHOT_LABELS)
+        event_time = _parsed_event_time(record)
+        if source and digest and event_time:
+            resource = record.get("resource", {})
+            scope = (resource.get("provider"), resource.get("name"), source)
+            snapshots[scope].append((event_time, digest, record))
+    for group in snapshots.values():
+        ordered = sorted(group, key=lambda entry: entry[0])
+        if len(ordered) < 3:
+            continue
+        # Inspect only adjacent, distinct timestamp refreshes.
+        same = [
+            record
+            for (t0, h0, _), (t1, h1, record) in zip(ordered, ordered[1:])
+            if t1 > t0 and h0 == h1
+        ]
+        if len(same) < 2:
+            continue
+        findings.append(
+            Finding(
+                category=CATEGORY_FRESHNESS,
+                title=f"{len(same)} refresh(es) returned unchanged snapshots",
+                reason=(
+                    "Consecutive observed refreshes produced identical source fingerprints at "
+                    "distinct timestamps. Consider measuring source-change cadence against refresh "
+                    "frequency. This does not establish that the source was unchanged between samples "
+                    "or that increasing TTL would be safe."
+                ),
+                confidence="low",
+                record_ids=[str(r["record_id"]) for r in same],
+                run_ids=sorted({str(r["run"]["run_id"]) for r in same}),
                 saving_ratio=0.0,
             )
         )
@@ -890,6 +951,7 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
         CATEGORY_CACHE: len(category_record_ids[CATEGORY_CACHE]),
         CATEGORY_ORCHESTRATION: len(category_record_ids[CATEGORY_ORCHESTRATION]),
         CATEGORY_REPLANNING: len(category_record_ids[CATEGORY_REPLANNING]),
+        CATEGORY_FRESHNESS: len(category_record_ids[CATEGORY_FRESHNESS]),
         CATEGORY_SMALLER: len(category_record_ids[CATEGORY_SMALLER]),
     }
 

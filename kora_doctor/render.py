@@ -11,6 +11,7 @@ LABELS = {
     "cache_reuse": "Cross-run reuse candidates",
     "orchestration_overhead": "Orchestration overhead",
     "replanning_loop": "Re-planning loop candidates",
+    "freshness_refresh": "Unchanged source refreshes",
     "smaller_model_candidate": "Smaller-model candidates",
 }
 
@@ -24,6 +25,7 @@ DISPLAY_ORDER = (
     "cache_reuse",
     "orchestration_overhead",
     "replanning_loop",
+    "freshness_refresh",
     "smaller_model_candidate",
 )
 

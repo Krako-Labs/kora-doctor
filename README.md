@@ -328,3 +328,18 @@ These are candidates, not validated waste or cost savings.
 ```bash
 kora-doctor audit samples/replanning_loops.jsonl
 ```
+
+
+### Observed source-refresh repetition
+
+Optional `attribution.labels` (also accepted in OTel span attributes):
+`source_refresh=true`, `source_id_hash`, and `source_snapshot_hash`.
+Three or more timestamped refreshes for the same provider, resource and
+hashed source, including two consecutive unchanged transitions, allow a
+low-confidence *unchanged refresh* candidate. Snapshot hashes must cover
+equivalent, stable content. This is **not** a safe TTL recommendation: changes
+between observations remain invisible. No dollar savings are estimated.
+
+```bash
+kora-doctor audit samples/freshness_refresh.jsonl
+```

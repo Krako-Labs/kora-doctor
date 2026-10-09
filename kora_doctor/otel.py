@@ -30,6 +30,9 @@ _CUSTOM_LABEL_MAP = {
     "next_action_after_hash": ("next_action_after_hash", "kora.next_action_after_hash"),
     "nonempty_result": ("nonempty_result", "kora.nonempty_result"),
     "expected_repeat": ("expected_repeat", "kora.expected_repeat"),
+    "source_id_hash": ("source_id_hash", "kora.source_id_hash"),
+    "source_snapshot_hash": ("source_snapshot_hash", "kora.source_snapshot_hash"),
+    "source_refresh": ("source_refresh", "kora.source_refresh"),
     "step_role": ("step_role", "kora.step_role", "gen_ai.step.role"),
     "planned_step_count": (
         "planned_step_count",
