@@ -33,6 +33,28 @@ class OtelTests(unittest.TestCase):
         self.assertEqual(len(retry), 1)
         self.assertEqual(retry[0].confidence, "medium")
 
+    def test_otel_conditional_consumer_metadata_is_preserved(self):
+        import json
+        import tempfile
+        records = load_records(str(ROOT / "samples/otel_audr.jsonl"))
+        span = {
+            "spanId": records[0]["run"]["span_id"],
+            "traceId": records[0]["run"].get("trace_id"),
+            "attributes": [
+                {"key": "gen_ai.output.consumed", "value": {"boolValue": False}},
+                {"key": "gen_ai.output.conditional_consumer_exists", "value": {"boolValue": True}},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            sidecar = Path(directory) / "otel.json"
+            sidecar.write_text(json.dumps({"spans": [span]}))
+            enriched, stats = enrich_with_otel(records, str(sidecar))
+        self.assertEqual(stats["matched"], 1)
+        self.assertEqual(enriched[0]["attribution"]["labels"]["conditional_consumer_exists"], "true")
+        findings = [f for f in analyze(enriched).findings if f.category == "unused_work"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "low")
+
     def test_otel_sidecar_does_not_persist_raw_payloads_in_labels(self):
         records = load_records(str(ROOT / "samples/otel_audr.jsonl"))
         enriched, _ = enrich_with_otel(records, str(ROOT / "samples/otel_sidecar.json"))

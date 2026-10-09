@@ -298,3 +298,18 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) or open an issue.
 ## License
 
 Apache-2.0.
+
+
+### Conditional consumers and unused output
+
+Optional AUDR `attribution.labels` (also accepted from matching OTel span attributes):
+`output_consumed=false`, `conditional_consumer_exists=true`, and
+`no_downstream_consumer=true`. These distinguish output not consumed **in the
+observed run** from a dormant fallback/approval/error path and an explicitly
+reported absence of any downstream consumer. Without the last signal, unused
+output remains a low-confidence candidate, **not proven dead work**. These
+findings never contribute to estimated savings. Example:
+
+```bash
+kora-doctor audit samples/conditional_consumers.jsonl
+```

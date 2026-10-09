@@ -68,6 +68,9 @@ OUTPUT_CONSUMED_LABELS = (
     "kora.output_consumed",
 )
 
+CONDITIONAL_CONSUMER_LABELS = ("conditional_consumer_exists", "kora.conditional_consumer_exists")
+NO_DOWNSTREAM_CONSUMER_LABELS = ("no_downstream_consumer", "kora.no_downstream_consumer")
+
 STEP_ROLE_LABELS = (
     "step_role",
     "kora.step_role",
@@ -198,6 +201,14 @@ def _label_int(record: Dict[str, Any], names: Tuple[str, ...]):
 
 def _output_consumed(record: Dict[str, Any]):
     return _label_bool(record, OUTPUT_CONSUMED_LABELS)
+
+
+def _conditional_consumer(record: Dict[str, Any]):
+    return _label_bool(record, CONDITIONAL_CONSUMER_LABELS)
+
+
+def _no_downstream_consumer(record: Dict[str, Any]):
+    return _label_bool(record, NO_DOWNSTREAM_CONSUMER_LABELS)
 
 
 def _step_role(record: Dict[str, Any]):
@@ -528,6 +539,8 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
     for record in records:
         consumed = _output_consumed(record)
         role = _step_role(record)
+        conditional = _conditional_consumer(record)
+        no_consumer = _no_downstream_consumer(record)
         planned = _planned_step_count(record)
         executed = _executed_step_count(record)
 
@@ -538,13 +551,15 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
                 f"steps, leaving {dead} planned step(s) unexecuted."
             )
             if consumed is False:
-                detail += " The planner output is also explicitly marked unconsumed."
+                detail += " The planner output was not consumed in this run."
+            if conditional is True:
+                detail += " A conditional downstream consumer exists, so unexecuted steps are not proven waste."
             findings.append(
                 Finding(
                     category=CATEGORY_UNUSED,
                     title=f"Planner produced {dead} unexecuted step(s)",
                     reason=detail,
-                    confidence="medium",
+                    confidence="low" if conditional is True else "medium",
                     record_ids=[str(record["record_id"])],
                     run_ids=[str(record["run"]["run_id"])],
                     saving_ratio=0.0,
@@ -556,13 +571,22 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
             findings.append(
                 Finding(
                     category=CATEGORY_UNUSED,
-                    title="Output explicitly marked unconsumed",
-                    reason=(
-                        "The trace source explicitly marks this operation's output as not consumed by "
-                        "downstream execution. KORA Doctor reports it as dead-work evidence without "
-                        "inferring from timing or span order."
+                    title=(
+                        "Conditional output not consumed in this run" if conditional is True
+                        else "Output explicitly has no downstream consumer" if no_consumer is True
+                        else "Output explicitly marked unconsumed"
                     ),
-                    confidence="medium",
+                    reason=(
+                        "The output was not consumed in this observed run, but a conditional downstream "
+                        "consumer exists. This is not proof of dead work."
+                        if conditional is True else
+                        "The trace explicitly reports no downstream consumer and no consumption in this run. "
+                        "Review before removal; execution may still be intentional."
+                        if no_consumer is True else
+                        "The trace marks this output unconsumed in the observed run, but does not establish "
+                        "whether a conditional or future downstream consumer exists."
+                    ),
+                    confidence="low" if conditional is True or no_consumer is not True else "medium",
                     record_ids=[str(record["record_id"])],
                     run_ids=[str(record["run"]["run_id"])],
                     saving_ratio=0.0,

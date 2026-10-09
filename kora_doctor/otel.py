@@ -22,6 +22,8 @@ _CUSTOM_LABEL_MAP = {
     "retry_of": ("retry_of", "kora.retry_of", "gen_ai.retry_of"),
     "retry_attempt": ("retry_attempt", "kora.retry_attempt", "gen_ai.retry.attempt"),
     "output_consumed": ("output_consumed", "kora.output_consumed", "gen_ai.output.consumed"),
+    "conditional_consumer_exists": ("conditional_consumer_exists", "kora.conditional_consumer_exists", "gen_ai.output.conditional_consumer_exists"),
+    "no_downstream_consumer": ("no_downstream_consumer", "kora.no_downstream_consumer", "gen_ai.output.no_downstream_consumer"),
     "step_role": ("step_role", "kora.step_role", "gen_ai.step.role"),
     "planned_step_count": (
         "planned_step_count",

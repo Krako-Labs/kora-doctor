@@ -126,8 +126,40 @@ class AnalyzerTests(unittest.TestCase):
         titles = {finding.title for finding in findings}
         self.assertIn("Planner produced 3 unexecuted step(s)", titles)
         self.assertIn("Output explicitly marked unconsumed", titles)
-        self.assertTrue(all(finding.confidence == "medium" for finding in findings))
+        self.assertEqual({f.confidence for f in findings}, {"medium", "low"})
         self.assertTrue(all(finding.saving_ratio == 0.0 for finding in findings))
+
+    def test_conditional_consumer_is_not_proven_dead_work(self):
+        import copy
+        base = load_records(str(ROOT / "samples/unused_work.jsonl"))
+        conditional = copy.deepcopy(base[1])
+        conditional["attribution"]["labels"]["conditional_consumer_exists"] = "true"
+        report = analyze([conditional])
+        finding = next(f for f in report.findings if f.category == "unused_work")
+        self.assertEqual(finding.confidence, "low")
+        self.assertIn("Conditional", finding.title)
+        self.assertIn("not proof of dead work", finding.reason)
+        self.assertEqual(finding.saving_ratio, 0)
+
+    def test_explicit_no_consumer_requires_evidence_for_medium_confidence(self):
+        import copy
+        base = load_records(str(ROOT / "samples/unused_work.jsonl"))
+        uncertain = analyze([base[1]])
+        self.assertEqual(next(f for f in uncertain.findings if f.category == "unused_work").confidence, "low")
+        proven = copy.deepcopy(base[1])
+        proven["attribution"]["labels"]["no_downstream_consumer"] = "true"
+        report = analyze([proven])
+        finding = next(f for f in report.findings if f.category == "unused_work")
+        self.assertEqual(finding.confidence, "medium")
+        self.assertIn("no downstream consumer", finding.title)
+
+    def test_conditional_consumers_sample_is_actionable(self):
+        report = analyze(load_records(str(ROOT / "samples/conditional_consumers.jsonl")))
+        findings = [f for f in report.findings if f.category == "unused_work"]
+        self.assertEqual(len(findings), 3)
+        self.assertEqual(sum("Conditional" in f.title for f in findings), 1)
+        self.assertEqual(sum(f.confidence == "medium" for f in findings), 1)
+        self.assertTrue(all(f.saving_ratio == 0 for f in findings))
 
     def test_savings_do_not_exceed_observed_cost(self):
         report = analyze(load_records(str(ROOT / "samples/inefficient_agent.jsonl")))
