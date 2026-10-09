@@ -24,6 +24,12 @@ _CUSTOM_LABEL_MAP = {
     "output_consumed": ("output_consumed", "kora.output_consumed", "gen_ai.output.consumed"),
     "conditional_consumer_exists": ("conditional_consumer_exists", "kora.conditional_consumer_exists", "gen_ai.output.conditional_consumer_exists"),
     "no_downstream_consumer": ("no_downstream_consumer", "kora.no_downstream_consumer", "gen_ai.output.no_downstream_consumer"),
+    "plan_before_hash": ("plan_before_hash", "kora.plan_before_hash"),
+    "plan_after_hash": ("plan_after_hash", "kora.plan_after_hash"),
+    "next_action_before_hash": ("next_action_before_hash", "kora.next_action_before_hash"),
+    "next_action_after_hash": ("next_action_after_hash", "kora.next_action_after_hash"),
+    "nonempty_result": ("nonempty_result", "kora.nonempty_result"),
+    "expected_repeat": ("expected_repeat", "kora.expected_repeat"),
     "step_role": ("step_role", "kora.step_role", "gen_ai.step.role"),
     "planned_step_count": (
         "planned_step_count",

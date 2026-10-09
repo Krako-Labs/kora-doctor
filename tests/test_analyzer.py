@@ -161,6 +161,14 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(sum(f.confidence == "medium" for f in findings), 1)
         self.assertTrue(all(f.saving_ratio == 0 for f in findings))
 
+    def test_replanning_requires_explicit_exclusion_of_intentional_repeats(self):
+        report = analyze(load_records(str(ROOT / "samples/replanning_loops.jsonl")))
+        findings = [f for f in report.findings if f.category == "replanning_loop"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "medium")
+        self.assertEqual(report.category_counts["replanning_loop"], 1)
+        self.assertEqual(findings[0].saving_ratio, 0)
+
     def test_savings_do_not_exceed_observed_cost(self):
         report = analyze(load_records(str(ROOT / "samples/inefficient_agent.jsonl")))
         self.assertLessEqual(report.potential_savings["USD"], report.observed_costs["USD"])

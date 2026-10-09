@@ -14,6 +14,7 @@ CATEGORY_CACHE = "cache_reuse"
 CATEGORY_DETERMINISTIC = "deterministic_candidate"
 CATEGORY_SMALLER = "smaller_model_candidate"
 CATEGORY_ORCHESTRATION = "orchestration_overhead"
+CATEGORY_REPLANNING = "replanning_loop"
 
 DETERMINISTIC_KEYWORDS = (
     "classif", "route", "routing", "validat", "schema", "format",
@@ -70,6 +71,13 @@ OUTPUT_CONSUMED_LABELS = (
 
 CONDITIONAL_CONSUMER_LABELS = ("conditional_consumer_exists", "kora.conditional_consumer_exists")
 NO_DOWNSTREAM_CONSUMER_LABELS = ("no_downstream_consumer", "kora.no_downstream_consumer")
+
+PLAN_BEFORE_HASH_LABELS = ("plan_before_hash", "kora.plan_before_hash")
+PLAN_AFTER_HASH_LABELS = ("plan_after_hash", "kora.plan_after_hash")
+NEXT_ACTION_BEFORE_HASH_LABELS = ("next_action_before_hash", "kora.next_action_before_hash")
+NEXT_ACTION_AFTER_HASH_LABELS = ("next_action_after_hash", "kora.next_action_after_hash")
+NONEMPTY_RESULT_LABELS = ("nonempty_result", "kora.nonempty_result")
+EXPECTED_REPEAT_LABELS = ("expected_repeat", "kora.expected_repeat")
 
 STEP_ROLE_LABELS = (
     "step_role",
@@ -535,6 +543,38 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
             )
         )
 
+    # Explicit action-plan/next-action identity, never prose similarity.
+    # Only exact fingerprints from the same execution transition qualify.
+    for record in records:
+        before = _label_fingerprint(record, PLAN_BEFORE_HASH_LABELS)
+        after = _label_fingerprint(record, PLAN_AFTER_HASH_LABELS)
+        next_before = _label_fingerprint(record, NEXT_ACTION_BEFORE_HASH_LABELS)
+        next_after = _label_fingerprint(record, NEXT_ACTION_AFTER_HASH_LABELS)
+        nonempty = _label_bool(record, NONEMPTY_RESULT_LABELS)
+        expected_repeat = _label_bool(record, EXPECTED_REPEAT_LABELS)
+        if expected_repeat is not False or nonempty is not True:
+            continue  # Cannot exclude intentional polling or backoff.
+        same_plan = bool(before and after and before == after)
+        same_next = bool(next_before and next_after and next_before == next_after)
+        if not (same_plan or same_next):
+            continue
+        finding_type = "unchanged action plan" if same_plan else "unchanged next action"
+        findings.append(
+            Finding(
+                category=CATEGORY_REPLANNING,
+                title=f"Potential re-planning loop: {finding_type}",
+                reason=(
+                    "Explicit before/after action fingerprints match despite an explicitly non-empty "
+                    "tool result, and the trace marks this repetition as not expected. "
+                    "This is a review candidate, not proof that reasoning was removable."
+                ),
+                confidence="medium" if same_plan and same_next else "low",
+                record_ids=[str(record["record_id"])],
+                run_ids=[str(record["run"]["run_id"])],
+                saving_ratio=0.0,
+            )
+        )
+
     # 3. Explicit unused-output / dead-planning evidence.
     for record in records:
         consumed = _output_consumed(record)
@@ -849,6 +889,7 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
         CATEGORY_DUPLICATE: len(category_record_ids[CATEGORY_DUPLICATE]),
         CATEGORY_CACHE: len(category_record_ids[CATEGORY_CACHE]),
         CATEGORY_ORCHESTRATION: len(category_record_ids[CATEGORY_ORCHESTRATION]),
+        CATEGORY_REPLANNING: len(category_record_ids[CATEGORY_REPLANNING]),
         CATEGORY_SMALLER: len(category_record_ids[CATEGORY_SMALLER]),
     }
 

@@ -313,3 +313,18 @@ findings never contribute to estimated savings. Example:
 ```bash
 kora-doctor audit samples/conditional_consumers.jsonl
 ```
+
+
+### Re-planning loop candidates (explicit evidence only)
+
+To inspect planning unchanged after a non-empty tool result, attach stable digests
+of **action lists**, never prose or raw payloads, as `attribution.labels`:
+`plan_before_hash`, `plan_after_hash`, `next_action_before_hash`,
+`next_action_after_hash`, `nonempty_result=true`, and `expected_repeat=false`.
+The last label must be supplied by the instrumented runtime; when unknown or
+true, KORA Doctor does not flag an intentional polling/retry-with-backoff loop.
+These are candidates, not validated waste or cost savings.
+
+```bash
+kora-doctor audit samples/replanning_loops.jsonl
+```

@@ -10,6 +10,7 @@ LABELS = {
     "duplicate_repeated": "Repeated model calls",
     "cache_reuse": "Cross-run reuse candidates",
     "orchestration_overhead": "Orchestration overhead",
+    "replanning_loop": "Re-planning loop candidates",
     "smaller_model_candidate": "Smaller-model candidates",
 }
 
@@ -22,6 +23,7 @@ DISPLAY_ORDER = (
     "duplicate_repeated",
     "cache_reuse",
     "orchestration_overhead",
+    "replanning_loop",
     "smaller_model_candidate",
 )
 
