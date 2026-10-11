@@ -1,3 +1,4 @@
+import copy
 import unittest
 from pathlib import Path
 
@@ -35,6 +36,51 @@ class AnalyzerTests(unittest.TestCase):
         self.assertTrue(any("repeated tool/read" in title for title in titles))
         self.assertIn("LLM used for deterministic validation", titles)
         self.assertTrue(any("Input context amplified" in title for title in titles))
+
+    def test_context_amplification_exposes_local_and_baseline_growth_shape(self):
+        report = analyze(load_records(str(ROOT / "samples/harness_waste.jsonl")))
+        findings = [
+            finding for finding in report.findings
+            if finding.category == "context_amplification"
+            and finding.title.startswith("Input context amplified")
+        ]
+        self.assertEqual(len(findings), 1)
+        reason = findings[0].reason
+        self.assertIn("vs the first reported call", reason)
+        self.assertIn("largest step-to-step delta", reason)
+        self.assertIn("sharp local jump", reason)
+        self.assertIn("not proof that a particular payload was unnecessary", reason)
+        self.assertEqual(findings[0].saving_ratio, 0.0)
+        self.assertEqual(findings[0].confidence, "low")
+
+    def test_context_amplification_surfaces_steady_cumulative_growth_without_local_jump(self):
+        base = load_records(str(ROOT / "samples/harness_waste.jsonl"))
+        records = [
+            copy.deepcopy(record)
+            for record in base
+            if record.get("resource", {}).get("type") == "model"
+        ]
+        tokens = [800, 1100, 1400, 1700, 2000]
+        for index, (record, input_tokens) in enumerate(zip(records, tokens), start=1):
+            record["run"]["run_id"] = "steady-context-growth"
+            record["run"]["step"] = index
+            record["usage"]["llm"]["input_tokens"] = input_tokens
+            record["record_id"] = f"steady-{index}"
+
+        report = analyze(records)
+        findings = [
+            finding for finding in report.findings
+            if finding.category == "context_amplification"
+            and finding.title == "Input context accumulated across the run"
+        ]
+        self.assertEqual(len(findings), 1)
+        reason = findings[0].reason
+        self.assertIn("no single transition", reason)
+        self.assertIn("steady cumulative growth", reason)
+        self.assertIn("largest step-to-step delta was 300 tokens", reason)
+        self.assertIn("not proof that a particular payload was unnecessary", reason)
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertEqual(findings[0].saving_ratio, 0.0)
 
     def test_repeated_tool_is_candidate_not_high_confidence(self):
         report = analyze(load_records(str(ROOT / "samples/harness_waste.jsonl")))

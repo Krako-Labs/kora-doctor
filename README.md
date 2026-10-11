@@ -91,6 +91,18 @@ KORA Doctor now prioritizes execution waste before model downsizing:
 
 The goal is to narrow a trace down to the execution steps a developer should inspect first.
 
+### Context-growth shape
+
+Context growth can show up in more than one way. KORA Doctor keeps the existing
+step-to-step amplification trigger for sharp local jumps, and also surfaces a
+low-confidence cumulative-growth candidate when input grows substantially
+relative to the first reported model call even though no single transition
+crosses that local trigger.
+
+The finding reports baseline-relative growth and the largest step-to-step
+delta. It still claims no savings from token growth alone because the trace
+does not prove which carried payload, if any, was unnecessary.
+
 ## Why the output says “candidate”
 
 AUDR v1.0.0 deliberately records usage/cost telemetry without prompt content or secrets. That is good for security, but it also means an AUDR record alone usually cannot prove that two model calls were semantically identical or that a task could definitely have been deterministic.

@@ -805,6 +805,23 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
                     growth_pairs.append((previous, current))
             previous = current
 
+        reported = [(record, _input_tokens(record)) for record in ordered]
+        reported = [(record, tokens) for record, tokens in reported if tokens is not None]
+        reported_tokens = [tokens for _, tokens in reported]
+        baseline = reported_tokens[0] if reported_tokens else None
+        final = reported_tokens[-1] if reported_tokens else None
+        local_deltas = [
+            current - previous
+            for previous, current in zip(reported_tokens, reported_tokens[1:])
+        ]
+        max_local_delta = max(local_deltas) if local_deltas else 0
+        cumulative_ratio = (
+            (final / baseline)
+            if baseline is not None and final is not None and baseline > 0
+            else 0.0
+        )
+        cumulative_percent = (cumulative_ratio - 1.0) * 100.0
+
         if growth_records:
             first_before, first_after = growth_pairs[0]
             findings.append(
@@ -813,8 +830,13 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
                     title=f"Input context amplified across {len(growth_records)} call(s)",
                     reason=(
                         f"Reported input tokens grew from {first_before} to {first_after} on the first "
-                        "flagged transition (>=1.5x and +500 tokens). This can indicate context carry-over, "
-                        "repeated retrieval results, or static tool definitions being paid for again."
+                        "flagged transition (>=1.5x and +500 tokens). "
+                        f"Across the run, input moved from {baseline} to {final} "
+                        f"({cumulative_percent:+.1f}% vs the first reported call); the largest step-to-step "
+                        f"delta was {max_local_delta} tokens, which indicates a sharp local jump. "
+                        "This can indicate context carry-over, repeated retrieval results, or static tool "
+                        "definitions being paid for again. Token growth is evidence about where to inspect, "
+                        "not proof that a particular payload was unnecessary."
                     ),
                     confidence="low",
                     record_ids=[str(r["record_id"]) for r in growth_records],
@@ -822,9 +844,33 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
                     saving_ratio=0.0,
                 )
             )
+        elif (
+            len(reported_tokens) >= 3
+            and baseline is not None
+            and final is not None
+            and baseline > 0
+            and final - baseline >= 500
+            and cumulative_ratio >= 1.5
+        ):
+            findings.append(
+                Finding(
+                    category=CATEGORY_CONTEXT,
+                    title="Input context accumulated across the run",
+                    reason=(
+                        f"Reported input tokens grew from {baseline} to {final} "
+                        f"({cumulative_percent:+.1f}% vs the first reported call), but no single transition "
+                        "crossed the local >=1.5x and +500-token trigger. "
+                        f"The largest step-to-step delta was {max_local_delta} tokens. This pattern is more "
+                        "consistent with steady cumulative growth than one large payload jump. Token growth "
+                        "is evidence about where to inspect, not proof that a particular payload was unnecessary."
+                    ),
+                    confidence="low",
+                    record_ids=[str(record["record_id"]) for record, _ in reported[1:]],
+                    run_ids=[run_id],
+                    saving_ratio=0.0,
+                )
+            )
 
-        reported = [(record, _input_tokens(record)) for record in ordered]
-        reported = [(record, tokens) for record, tokens in reported if tokens is not None]
         if len(reported) >= 3:
             values = [tokens for _, tokens in reported]
             low = min(values)
