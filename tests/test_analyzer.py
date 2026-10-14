@@ -130,6 +130,46 @@ class AnalyzerTests(unittest.TestCase):
         ]
         self.assertEqual(findings, [])
 
+    def test_mixed_fingerprints_do_not_flag_known_distinct_reads(self):
+        records = copy.deepcopy(load_records(str(ROOT / "tests/fixtures/tool_fingerprints_distinct.jsonl")))
+        records[2]["attribution"]["labels"].pop("tool_args_hash")
+        findings = [f for f in analyze(records).findings if f.category == "repeated_tool_retrieval"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].record_ids, [records[2]["record_id"]])
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertEqual(findings[0].saving_ratio, 0.0)
+
+    def test_mixed_fingerprints_with_missing_middle_preserves_distinct_last(self):
+        records = copy.deepcopy(load_records(str(ROOT / "tests/fixtures/tool_fingerprints_distinct.jsonl")))
+        records[1]["attribution"]["labels"].pop("tool_args_hash")
+        findings = [f for f in analyze(records).findings if f.category == "repeated_tool_retrieval"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].record_ids, [records[1]["record_id"]])
+
+    def test_explicit_retry_of_successful_retrieval_is_candidate_not_proof(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/retry_lineage.jsonl")))
+        records[0]["attribution"]["labels"]["operation_status"] = "success"
+        report = analyze(records)
+        findings = [f for f in report.findings if f.category == "retry_overhead"]
+        self.assertEqual(len(findings), 1)
+        self.assertIn("previously successful", findings[0].title)
+        self.assertEqual(findings[0].confidence, "medium")
+        self.assertEqual(findings[0].saving_ratio, 0.0)
+
+    def test_span_id_collision_prefers_retried_record_in_same_run(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/retry_lineage.jsonl")))
+        records[0]["attribution"]["labels"]["operation_status"] = "success"
+        records[1]["attribution"]["labels"]["retry_of"] = records[0]["run"]["span_id"]
+        unrelated = copy.deepcopy(records[0])
+        unrelated["record_id"] = "unrelated-colliding-span"
+        unrelated["run"]["run_id"] = "different-run"
+        unrelated["attribution"]["labels"]["operation_status"] = "timeout"
+        records.append(unrelated)
+        report = analyze(records)
+        findings = [f for f in report.findings if f.category == "retry_overhead"]
+        self.assertEqual(len(findings), 1)
+        self.assertIn("previously successful", findings[0].title)
+
     def test_fingerprint_findings_do_not_claim_savings(self):
         report = analyze(load_records(str(ROOT / "samples/tool_fingerprints.jsonl")))
         findings = [
@@ -139,6 +179,31 @@ class AnalyzerTests(unittest.TestCase):
         self.assertTrue(findings)
         self.assertTrue(all(finding.saving_ratio == 0.0 for finding in findings))
 
+
+    def test_downstream_failure_alone_does_not_prove_chain_retry(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/retry_lineage.jsonl")))
+        records[0]["attribution"]["labels"]["operation_status"] = "success"
+        records[1]["resource"]["name"] = "downstream_action"
+        records[1]["attribution"]["labels"]["operation_status"] = "failed"
+        records[1]["attribution"]["labels"].pop("retry_of")
+        records[1]["attribution"]["labels"].pop("retry_attempt")
+        records[2]["attribution"]["labels"]["tool_args_hash"] = records[0]["attribution"]["labels"]["tool_args_hash"]
+        report = analyze(records)
+        self.assertTrue([f for f in report.findings if f.category == "repeated_tool_retrieval"])
+        self.assertFalse([f for f in report.findings if f.category == "retry_overhead"])
+
+    def test_span_id_ambiguous_across_runs_is_unresolved(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/retry_lineage.jsonl")))
+        records[0]["run"]["run_id"] = "other-run-a"
+        records[1]["attribution"]["labels"]["retry_of"] = records[0]["run"]["span_id"]
+        unrelated = copy.deepcopy(records[0])
+        unrelated["record_id"] = "other-run-b-same-span"
+        unrelated["run"]["run_id"] = "other-run-b"
+        records.append(unrelated)
+        findings = [f for f in analyze(records).findings if f.category == "retry_overhead"]
+        self.assertEqual(len(findings), 1)
+        self.assertIn("without resolvable prior", findings[0].title)
+        self.assertEqual(findings[0].confidence, "low")
 
     def test_explicit_retry_lineage_with_same_args_is_detected(self):
         report = analyze(load_records(str(ROOT / "samples/retry_lineage.jsonl")))

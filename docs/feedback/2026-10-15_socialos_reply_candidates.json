@@ -1,0 +1,143 @@
+{
+  "schema_version": 1,
+  "campaign": "FEEDBACK-001",
+  "status": "DRAFT_ONLY_NO_SEND",
+  "cases": [
+    {
+      "person": "Ali Asghar",
+      "platform": "linkedin",
+      "source_url": "https://www.linkedin.com/feed/update/urn:li:share:7513446186054524928/",
+      "related_issues": [
+        1,
+        4
+      ],
+      "status": "draft_after_target_reconciliation",
+      "draft": "Your point about metadata-only duplicates caught a real edge case in Doctor. Two reads had different argument fingerprints, but when a third lacked a fingerprint, the analyzer counted one of those distinct reads as a repeat. I've fixed that locally: distinct hashed reads stay distinct, and only the uninstrumented call remains a low-confidence candidate. It's in QA, not a public release yet. Thanks for pushing on the evidence boundary.",
+      "project": "Krako-Labs/kora-doctor",
+      "campaign": "FEEDBACK-001",
+      "mode": "REVIEW_ONLY",
+      "approval_required": true,
+      "publish_authorized": false,
+      "source_evidence": "SocialOS inbox snapshot; user self-report unverified",
+      "draft_release_state": "existing_public_features_or_local_qa_disclosed"
+    },
+    {
+      "person": "u/verstands",
+      "platform": "reddit",
+      "source_url": "https://www.reddit.com/r/LLMDevs/comments/1wzot7j/how_do_you_tell_which_llm_calls_in_an_agent_run/pel30s0/",
+      "related_issues": [
+        1,
+        4
+      ],
+      "status": "draft_after_release_gate",
+      "draft": "Your point about false positives held up. I found and fixed a case where one missing argument fingerprint caused Doctor to flag an entirely different, known-distinct read as a duplicate. Retry span lookup is also now run-aware when IDs collide. Both are passing local QA; I'm not calling them production-proven or publicly released yet. The rule is still: here's the observed evidence, not 'delete this call.'",
+      "project": "Krako-Labs/kora-doctor",
+      "campaign": "FEEDBACK-001",
+      "mode": "REVIEW_ONLY",
+      "approval_required": true,
+      "publish_authorized": false,
+      "source_evidence": "SocialOS inbox snapshot; user self-report unverified",
+      "draft_release_state": "local_qa_not_public"
+    },
+    {
+      "person": "Abozar @abo0zar",
+      "platform": "x",
+      "source_url": "https://x.com/abo0zar/status/2108044861257531395",
+      "related_issues": [
+        4
+      ],
+      "status": "draft_after_release_gate",
+      "draft": "You were right: a timeout means the outcome is unknown, not necessarily failed. Doctor treats explicit retry lineage and outcome status as diagnostic evidence, not permission to replay a side-effecting action. I also tightened span resolution across runs in local QA. It doesn't reconcile external state or automatically retry, and I won't claim it does.",
+      "project": "Krako-Labs/kora-doctor",
+      "campaign": "FEEDBACK-001",
+      "mode": "REVIEW_ONLY",
+      "approval_required": true,
+      "publish_authorized": false,
+      "source_evidence": "SocialOS inbox snapshot; user self-report unverified",
+      "draft_release_state": "local_qa_not_public"
+    },
+    {
+      "person": "Gaurav Bhowmick @gaurav0bhowmick",
+      "platform": "x",
+      "source_url": "https://x.com/gaurav0bhowmick/status/2107734828045201908",
+      "related_issues": [
+        1,
+        2,
+        8
+      ],
+      "status": "draft_available_for_approval",
+      "draft": "You asked to see Doctor on a messy real-world agent log. That's still the test that matters. The CLI already reports repeated tool/read candidates per run and uses argument/result hashes when traces provide them, without pretending every repeat is waste. We're looking for a redacted AUDR JSONL or OTLP JSON fixture here: https://github.com/Krako-Labs/kora-doctor/issues/8. No prompts or secrets needed.",
+      "project": "Krako-Labs/kora-doctor",
+      "campaign": "FEEDBACK-001",
+      "mode": "REVIEW_ONLY",
+      "approval_required": true,
+      "publish_authorized": false,
+      "source_evidence": "SocialOS inbox snapshot; user self-report unverified",
+      "draft_release_state": "existing_public_features_or_local_qa_disclosed"
+    },
+    {
+      "person": "u/Wooden_Jelly_5295",
+      "platform": "reddit",
+      "source_url": "https://www.reddit.com/r/LLMDevs/comments/1wzot7j/how_do_you_tell_which_llm_calls_in_an_agent_run/peft7dv/",
+      "related_issues": [
+        7
+      ],
+      "status": "draft_available_for_approval",
+      "draft": "Not faithfully from AUDR alone. It records usage and metadata, not the prompt bodies, tool results, and dependencies needed to replay a run after deleting a call. I logged runtime-backed counterfactual replay as https://github.com/Krako-Labs/kora-doctor/issues/7, but I'm prioritizing real traces and false-positive checks first. A reproducible harness fixture is the right next validation step.",
+      "project": "Krako-Labs/kora-doctor",
+      "campaign": "FEEDBACK-001",
+      "mode": "REVIEW_ONLY",
+      "approval_required": true,
+      "publish_authorized": false,
+      "source_evidence": "SocialOS inbox snapshot; user self-report unverified",
+      "draft_release_state": "existing_public_features_or_local_qa_disclosed"
+    },
+    {
+      "person": "u/Future_AGI",
+      "platform": "reddit",
+      "source_url": "https://www.reddit.com/r/AgentsOfAI/comments/1wzow9e/i_built_an_audr_analyzer_to_find_agent_calls/peh8gnc/",
+      "related_issues": [
+        2,
+        3,
+        4,
+        8
+      ],
+      "status": "draft_available_for_approval",
+      "draft": "Your status-aware tracing example is useful. Doctor now keeps explicit retries separate from plain repeated-call heuristics, and it needs explicit evidence before treating an output as unused. We haven't verified a direct Future AGI export path, so I'm not claiming integration. If you can share a scrubbed OTLP JSON trace with operation outcomes and retry links, I'd test it against the current CLI before building another adapter.",
+      "project": "Krako-Labs/kora-doctor",
+      "campaign": "FEEDBACK-001",
+      "mode": "REVIEW_ONLY",
+      "approval_required": true,
+      "publish_authorized": false,
+      "source_evidence": "SocialOS inbox snapshot; user self-report unverified",
+      "draft_release_state": "existing_public_features_or_local_qa_disclosed"
+    },
+    {
+      "person": "u/Jolly_Equivalent_985",
+      "platform": "reddit",
+      "source_url": "https://www.reddit.com/r/LLMDevs/comments/1wzot7j/how_do_you_tell_which_llm_calls_in_an_agent_run/peejfiq/",
+      "related_issues": [
+        1,
+        3,
+        4
+      ],
+      "status": "draft_after_release_gate",
+      "draft": "Your paid-tool example is exactly why Doctor reports repeated tool/read calls independently of model-token usage. When a trace supplies argument/result hashes, it can distinguish stronger repeat evidence from tool-name matches, but it won't automatically count those reads as avoidable savings or assume a TTL is safe. We just tightened a mixed-fingerprint false positive in local QA. Thanks for the practical breakdown.",
+      "project": "Krako-Labs/kora-doctor",
+      "campaign": "FEEDBACK-001",
+      "mode": "REVIEW_ONLY",
+      "approval_required": true,
+      "publish_authorized": false,
+      "source_evidence": "SocialOS inbox snapshot; user self-report unverified",
+      "draft_release_state": "local_qa_not_public"
+    }
+  ],
+  "hold_no_duplicate_reply": [
+    "Jarrod De Lange",
+    "u/KimLikeJ",
+    "u/dylan_skydive",
+    "u/Most-Agent-7566",
+    "u/Significant_Tune9219"
+  ],
+  "source": "SocialOS local inbox + GitHub issues; manual review"
+}

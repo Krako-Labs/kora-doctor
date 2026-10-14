@@ -394,71 +394,64 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
             else:
                 without_args_hash.append(record)
 
-        exact_groups = [records for records in by_args_hash.values() if len(records) >= 2]
-        if exact_groups:
-            for exact_group in exact_groups:
-                duplicates = exact_group[1:]
-                result_hashes = [_tool_result_hash(record) for record in exact_group]
-                nonempty_results = [value for value in result_hashes if value]
-                same_result = (
-                    len(nonempty_results) == len(exact_group)
-                    and len(set(nonempty_results)) == 1
+        exact_groups = [items for items in by_args_hash.values() if len(items) >= 2]
+        for exact_group in exact_groups:
+            duplicates = exact_group[1:]
+            result_hashes = [_tool_result_hash(record) for record in exact_group]
+            same_result = all(result_hashes) and len(set(result_hashes)) == 1
+
+            if same_result:
+                title = f"{len(duplicates)} exact repeated tool call(s): {resource_name}"
+                reason = (
+                    "The same tool/resource repeated in one run with the same argument fingerprint "
+                    "and the same result fingerprint. This is strong evidence of repeated work, "
+                    "though freshness or safety checks may still justify the second call."
+                )
+            else:
+                title = f"{len(duplicates)} same-argument tool call(s): {resource_name}"
+                reason = (
+                    "The same tool/resource repeated in one run with the same argument fingerprint. "
+                    "This is stronger evidence than a resource-name match alone, but changing external "
+                    "state can still make a repeated read legitimate."
                 )
 
-                if same_result:
-                    title = f"{len(duplicates)} exact repeated tool call(s): {resource_name}"
-                    reason = (
-                        "The same tool/resource repeated in one run with the same argument fingerprint "
-                        "and the same result fingerprint. This is strong evidence of repeated work, "
-                        "though freshness or safety checks may still justify the second call."
-                    )
-                else:
-                    title = f"{len(duplicates)} same-argument tool call(s): {resource_name}"
-                    reason = (
-                        "The same tool/resource repeated in one run with the same argument fingerprint. "
-                        "This is stronger evidence than a resource-name match alone, but changing external "
-                        "state can still make a repeated read legitimate."
-                    )
+            findings.append(
+                Finding(
+                    category=CATEGORY_REPEATED_TOOL,
+                    title=title,
+                    reason=reason,
+                    confidence="medium",
+                    record_ids=[str(record["record_id"]) for record in duplicates],
+                    run_ids=[run_id],
+                    saving_ratio=0.0,
+                )
+            )
 
+        if by_args_hash:
+            # Known-distinct hashes are *not* duplicate candidates merely
+            # because another call in the group is missing a fingerprint.
+            # Attribute uncertainty only to later uninstrumented calls.
+            unverified = [record for record in ordered[1:] if not _tool_args_hash(record)]
+            if unverified:
                 findings.append(
                     Finding(
                         category=CATEGORY_REPEATED_TOOL,
-                        title=title,
-                        reason=reason,
-                        confidence="medium",
-                        record_ids=[str(record["record_id"]) for record in duplicates],
-                        run_ids=[run_id],
-                        saving_ratio=0.0,
-                    )
-                )
-
-            # Hashes were available, so do not downgrade distinct hashed calls
-            # into a generic duplicate merely because they used the same tool.
-            if len(without_args_hash) >= 2:
-                duplicates = without_args_hash[1:]
-                findings.append(
-                    Finding(
-                        category=CATEGORY_REPEATED_TOOL,
-                        title=f"{len(duplicates)} unverified repeated tool/read call(s): {resource_name}",
+                        title=f"{len(unverified)} unverified repeated tool/read call(s): {resource_name}",
                         reason=(
-                            "The same tool/resource repeated, but these calls did not carry an argument "
-                            "fingerprint. They remain low-confidence reuse candidates."
+                            "Some calls lack argument fingerprints. Only those later uninstrumented "
+                            "calls are flagged as low-confidence reuse candidates; calls with distinct "
+                            "argument fingerprints are not marked as duplicates."
                         ),
                         confidence="low",
-                        record_ids=[str(record["record_id"]) for record in duplicates],
+                        record_ids=[str(record["record_id"]) for record in unverified],
                         run_ids=[run_id],
                         saving_ratio=0.0,
                     )
                 )
             continue
 
-        # No repeated argument fingerprint was available. If hashes exist but
-        # are all distinct, that is evidence these were different requests and
-        # we should not flag them as duplicates.
-        hashed = [record for record in ordered if _tool_args_hash(record)]
-        if hashed and not without_args_hash:
-            continue
-
+        # With no hashes available, metadata can suggest a repeated resource
+        # but cannot establish identical arguments or unnecessary execution.
         duplicates = ordered[1:]
         findings.append(
             Finding(
@@ -466,7 +459,7 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
                 title=f"{len(duplicates)} repeated tool/read call(s): {resource_name}",
                 reason=(
                     "The same AUDR tool/resource and operation repeated within one run. "
-                    "No repeated argument fingerprint was available, so this is an observed "
+                    "No argument fingerprints were available, so this is an observed "
                     "repeat and a reuse candidate, not proof that the second call was unnecessary."
                 ),
                 confidence="low",
@@ -481,11 +474,11 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
     # AUDR v1.0.0 has run-level error/outcome fields but no per-operation retry
     # lineage. Richer trace sources can preserve that evidence in labels.
     record_by_record_id = {str(record.get("record_id")): record for record in records}
-    record_by_span_id = {
-        str(record.get("run", {}).get("span_id")): record
-        for record in records
-        if record.get("run", {}).get("span_id")
-    }
+    records_by_span_id = defaultdict(list)
+    for record in records:
+        span_id = record.get("run", {}).get("span_id")
+        if span_id:
+            records_by_span_id[str(span_id)].append(record)
 
     for record in records:
         retry_ref = _retry_of(record)
@@ -495,7 +488,19 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
 
         previous = None
         if retry_ref:
-            previous = record_by_record_id.get(retry_ref) or record_by_span_id.get(retry_ref)
+            previous = record_by_record_id.get(retry_ref)
+            if previous is None:
+                candidates = [item for item in records_by_span_id.get(retry_ref, []) if item is not record]
+                same_run = [
+                    item for item in candidates
+                    if item.get("run", {}).get("run_id") == record.get("run", {}).get("run_id")
+                ]
+                # Span IDs often repeat across separate runs. Resolve by run
+                # first, and never pick an arbitrary global collision.
+                if len(same_run) == 1:
+                    previous = same_run[0]
+                elif not same_run and len(candidates) == 1:
+                    previous = candidates[0]
 
         if previous is None:
             findings.append(
