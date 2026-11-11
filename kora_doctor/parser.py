@@ -1,4 +1,5 @@
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -19,6 +20,13 @@ def _validate_record(record: Any, index: int) -> Dict[str, Any]:
     missing = [k for k in _REQUIRED_TOP if k not in record]
     if missing:
         raise InputError(f"record {index}: missing required AUDR field(s): {', '.join(missing)}")
+
+    for field in ("emitter", "timing", "attribution"):
+        if not isinstance(record.get(field), dict):
+            raise InputError(f"record {index}: {field} must be an object")
+    labels = record["attribution"].get("labels")
+    if labels is not None and not isinstance(labels, dict):
+        raise InputError(f"record {index}: attribution.labels must be an object")
 
     resource = record.get("resource")
     if not isinstance(resource, dict):
@@ -43,6 +51,29 @@ def _validate_record(record: Any, index: int) -> Dict[str, Any]:
     return record
 
 
+def _reject_nonfinite(_value: str) -> None:
+    # json.loads accepts NaN and Infinity by default, although JSON does not.
+    raise InputError("invalid AUDR JSON number: non-finite value")
+
+
+def _parse_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise InputError("invalid AUDR JSON number: non-finite value")
+    return parsed
+
+
+def _load_json(text: str) -> Any:
+    try:
+        return json.loads(text, parse_constant=_reject_nonfinite, parse_float=_parse_float)
+    except RecursionError as exc:
+        raise InputError("invalid AUDR JSON: nesting too deep") from exc
+    except ValueError as exc:
+        if isinstance(exc, (InputError, json.JSONDecodeError)):
+            raise
+        raise InputError("invalid AUDR JSON number") from exc
+
+
 def load_records(path: str) -> List[Dict[str, Any]]:
     p = Path(path)
     if not p.exists():
@@ -50,13 +81,16 @@ def load_records(path: str) -> List[Dict[str, Any]]:
     if not p.is_file():
         raise InputError(f"input must be a file: {path}")
 
-    text = p.read_text(encoding="utf-8")
+    try:
+        text = p.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise InputError("input must be UTF-8 encoded") from exc
     if not text.strip():
         raise InputError("input contains no records")
 
     records: List[Any]
     try:
-        parsed = json.loads(text)
+        parsed = _load_json(text)
         if isinstance(parsed, list):
             records = parsed
         elif isinstance(parsed, dict):
@@ -69,11 +103,28 @@ def load_records(path: str) -> List[Dict[str, Any]]:
             if not line.strip():
                 continue
             try:
-                records.append(json.loads(line))
+                records.append(_load_json(line))
             except json.JSONDecodeError as exc:
                 raise InputError(f"invalid JSONL at line {line_no}: {exc.msg}") from exc
+            except InputError as exc:
+                # Only propagate controlled parser messages, never source values.
+                raise InputError(f"invalid JSONL at line {line_no}: {exc}") from exc
 
     if not records:
         raise InputError("input contains no records")
 
-    return [_validate_record(record, i) for i, record in enumerate(records, 1)]
+    validated = []
+    seen_record_ids: Dict[str, int] = {}
+    for index, record in enumerate(records, 1):
+        checked = _validate_record(record, index)
+        # Findings reference record_id, and savings are looked up by ID.
+        # A collision would assign a finding to an unrelated call's cost.
+        record_id = str(checked["record_id"])
+        if record_id in seen_record_ids:
+            raise InputError(
+                f"record {index}: duplicate record_id (already seen in "
+                f"record {seen_record_ids[record_id]})"
+            )
+        seen_record_ids[record_id] = index
+        validated.append(checked)
+    return validated

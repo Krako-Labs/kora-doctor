@@ -4,7 +4,7 @@ KORA Doctor is intentionally small.
 
 The most useful contributions right now are:
 
-- AUDR traces that expose a false positive or missed optimization candidate
+- **Privacy-reviewed real AUDR traces** that expose a false positive or missed optimization candidate (see [real trace intake guide](docs/REAL_TRACE_INTAKE.md); never upload raw logs or unreviewed reports)
 - small heuristic improvements with a concrete before/after example
 - compatibility fixes for real AUDR emitters and adapters
 - installation or CLI bugs

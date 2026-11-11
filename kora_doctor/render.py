@@ -4,6 +4,7 @@ from .model import AuditReport
 LABELS = {
     "repeated_tool_retrieval": "Repeated tool/read calls",
     "retry_overhead": "Retry overhead",
+    "rate_limit_retry_chain": "HTTP 429 retry chains",
     "unused_work": "Unused/dead work",
     "context_amplification": "Context amplification",
     "deterministic_candidate": "Deterministic candidates",
@@ -18,6 +19,7 @@ LABELS = {
 DISPLAY_ORDER = (
     "repeated_tool_retrieval",
     "retry_overhead",
+    "rate_limit_retry_chain",
     "unused_work",
     "context_amplification",
     "deterministic_candidate",
@@ -42,7 +44,8 @@ def render_text(report: AuditReport, top: int = 8) -> str:
     lines.append("Find execution waste in AI agent runs.")
     lines.append("")
     lines.append(
-        f"Observed: {report.records} records · {report.runs} runs · "
+        f"Observed: {report.records} records · {report.runs} "
+        f"{'run' if report.runs == 1 else 'runs'} · "
         f"{report.model_calls} model calls · {report.tool_calls} tool calls"
     )
 
@@ -52,8 +55,8 @@ def render_text(report: AuditReport, top: int = 8) -> str:
             optimized = max(0.0, total - saved)
             pct = saved / total * 100.0 if total else 0.0
             lines.append(f"Observed cost:                 {_money(total, currency):>12}")
-            lines.append(f"Potentially avoidable:         {_money(saved, currency):>12}  ({pct:.0f}%)")
-            lines.append(f"Estimated optimized cost:      {_money(optimized, currency):>12}")
+            lines.append(f"Illustrative savings:         {_money(saved, currency):>12}  ({pct:.0f}%)")
+            lines.append(f"Illustrative remainder:      {_money(optimized, currency):>12}")
     else:
         lines.append("Observed cost:                 not reported")
 
@@ -105,4 +108,6 @@ def render_text(report: AuditReport, top: int = 8) -> str:
     lines.append("")
     lines.append("Fix execution waste first. Downsize models second.")
     lines.append("KORA Doctor reports candidates with evidence and confidence, not certainty.")
+    lines.append("Savings scenarios are hypothetical, not measured results.")
+    lines.append("Do not remove calls without replay and quality checks.")
     return "\n".join(lines)

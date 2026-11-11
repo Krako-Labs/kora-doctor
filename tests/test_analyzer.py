@@ -122,6 +122,21 @@ class AnalyzerTests(unittest.TestCase):
         self.assertIn("exact repeated tool call", findings[0].title)
         self.assertEqual(len(findings[0].record_ids), 1)
 
+    def test_repeated_tool_is_scoped_to_matching_trace_identity(self):
+        source = load_records(str(ROOT / "samples/tool_fingerprints.jsonl"))[:2]
+        for first_trace, second_trace, expected in (
+            ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 0),
+            ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", None, 0),
+            ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1),
+        ):
+            with self.subTest(first_trace=first_trace, second_trace=second_trace):
+                records = copy.deepcopy(source)
+                records[0]["run"]["trace_id"] = first_trace
+                if second_trace is not None:
+                    records[1]["run"]["trace_id"] = second_trace
+                report = analyze(records)
+                self.assertEqual(report.category_counts["repeated_tool_retrieval"], expected)
+
     def test_distinct_argument_fingerprints_are_not_called_duplicates(self):
         report = analyze(load_records(str(ROOT / "tests/fixtures/tool_fingerprints_distinct.jsonl")))
         findings = [
@@ -169,6 +184,193 @@ class AnalyzerTests(unittest.TestCase):
         findings = [f for f in report.findings if f.category == "retry_overhead"]
         self.assertEqual(len(findings), 1)
         self.assertIn("previously successful", findings[0].title)
+
+    def _rate_limit_attempts(self):
+        base = load_records(str(ROOT / "samples/retry_lineage.jsonl"))[0]
+        records = []
+        for i, status in enumerate([429, 429, 429, 200]):
+            event = copy.deepcopy(base)
+            event["record_id"] = f"rate-limit-attempt-{i + 1}"
+            event["run"]["span_id"] = f"rate-limit-span-{i + 1}"
+            event["run"]["step"] = i + 1
+            event["timing"]["event_time"] = f"2026-10-08T02:00:0{i + 1}.000Z"
+            labels = event["attribution"]["labels"]
+            labels["http_status_code"] = str(status)
+            labels["operation_status"] = "failed" if status == 429 else "success"
+            if i > 0:
+                labels["retry_of"] = records[i - 1]["record_id"]
+                labels["retry_attempt"] = str(i + 1)
+            records.append(event)
+        return records
+
+    def test_http_429_chain_counts_one_operation_not_four_failures(self):
+        records = self._rate_limit_attempts()
+        report = analyze(records)
+        findings = [f for f in report.findings if f.category == "rate_limit_retry_chain"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(report.category_counts["rate_limit_retry_chain"], 1)
+        self.assertEqual(findings[0].record_ids, [r["record_id"] for r in records])
+        self.assertIn("4 attempts, 3 rate-limit", findings[0].title)
+        self.assertIn("eventual HTTP success", findings[0].reason)
+        self.assertIn("does not prove a header conflict", findings[0].reason)
+        self.assertEqual(findings[0].saving_ratio, 0.0)
+        self.assertEqual(findings[0].confidence, "medium")
+
+    def test_http_429_retries_are_not_counted_as_redundant_tool_reads(self):
+        records = self._rate_limit_attempts()
+        report = analyze(records)
+        self.assertEqual(report.category_counts["rate_limit_retry_chain"], 1)
+        self.assertEqual(report.category_counts["repeated_tool_retrieval"], 0)
+        self.assertFalse([
+            finding for finding in report.findings
+            if finding.category == "repeated_tool_retrieval"
+        ])
+
+    def test_http_429_chain_preserves_unrelated_same_argument_repeat(self):
+        records = self._rate_limit_attempts()
+        extra = copy.deepcopy(records[-1])
+        extra["record_id"] = "independent-follow-up"
+        extra["run"]["span_id"] = "independent-follow-up-span"
+        extra["run"]["step"] = 5
+        extra["timing"]["event_time"] = "2026-10-08T02:00:05.000Z"
+        extra["attribution"]["labels"].pop("retry_of")
+        extra["attribution"]["labels"].pop("retry_attempt")
+        records.append(extra)
+
+        report = analyze(records)
+        repeats = [f for f in report.findings if f.category == "repeated_tool_retrieval"]
+        self.assertEqual(report.category_counts["rate_limit_retry_chain"], 1)
+        self.assertEqual(report.category_counts["repeated_tool_retrieval"], 1)
+        self.assertEqual(len(repeats), 1)
+        self.assertEqual(repeats[0].record_ids, ["independent-follow-up"])
+        self.assertIn("1 same-argument", repeats[0].title)
+        self.assertEqual(repeats[0].saving_ratio, 0)
+
+    def test_429_without_explicit_retry_chain_retains_low_confidence_repeat_signal(self):
+        records = self._rate_limit_attempts()
+        for record in records[1:]:
+            record["attribution"]["labels"].pop("retry_of")
+            record["attribution"]["labels"].pop("retry_attempt")
+        report = analyze(records)
+        self.assertEqual(report.category_counts["rate_limit_retry_chain"], 0)
+        self.assertEqual(report.category_counts["repeated_tool_retrieval"], 3)
+
+    def test_http_429_conflicting_reported_success_is_low_confidence(self):
+        records = self._rate_limit_attempts()
+        records[1]["attribution"]["labels"]["operation_status"] = "success"
+        findings = [f for f in analyze(records).findings if f.category == "rate_limit_retry_chain"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertIn("conflicting HTTP and operation statuses", findings[0].reason)
+        self.assertIn("final outcome not established", findings[0].reason)
+        self.assertEqual(findings[0].saving_ratio, 0.0)
+
+    def test_http_200_with_reported_failure_does_not_certify_success(self):
+        records = self._rate_limit_attempts()
+        records[-1]["attribution"]["labels"]["operation_status"] = "failed"
+        findings = [f for f in analyze(records).findings if f.category == "rate_limit_retry_chain"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertIn("final outcome not established", findings[0].reason)
+        self.assertNotIn("eventual HTTP success", findings[0].reason)
+
+    def test_http_429_without_explicit_retry_links_is_not_a_chain(self):
+        records = self._rate_limit_attempts()
+        for record in records[1:]:
+            record["attribution"]["labels"].pop("retry_of")
+            record["attribution"]["labels"].pop("retry_attempt")
+        report = analyze(records)
+        self.assertEqual(report.category_counts["rate_limit_retry_chain"], 0)
+
+    def test_http_429_branch_is_not_assumed_to_be_one_serial_operation(self):
+        records = self._rate_limit_attempts()
+        records[2]["attribution"]["labels"]["retry_of"] = records[0]["record_id"]
+        report = analyze(records)
+        self.assertEqual(report.category_counts["rate_limit_retry_chain"], 0)
+
+    def test_http_429_cross_run_link_is_not_merged(self):
+        records = self._rate_limit_attempts()[:2]
+        records[0]["run"]["run_id"] = "different-run"
+        self.assertEqual(analyze(records).category_counts["rate_limit_retry_chain"], 0)
+
+    def test_http_429_chain_missing_last_status_keeps_outcome_conservative(self):
+        records = self._rate_limit_attempts()
+        records[-1]["attribution"]["labels"].pop("http_status_code")
+        records[-1]["attribution"]["labels"].pop("operation_status")
+        findings = [f for f in analyze(records).findings if f.category == "rate_limit_retry_chain"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertIn("final outcome not established", findings[0].reason)
+
+    def test_explicit_retry_rejects_different_trace_with_reused_run_id(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/retry_lineage.jsonl")))
+        records[0]["run"]["trace_id"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        records[1]["run"]["trace_id"] = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        findings = [f for f in analyze(records).findings if f.category == "retry_overhead"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertIn("without resolvable prior", findings[0].title)
+
+    def test_explicit_retry_rejects_mixed_known_and_missing_trace_id(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/retry_lineage.jsonl")))
+        records[0]["run"]["trace_id"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        findings = [f for f in analyze(records).findings if f.category == "retry_overhead"]
+        self.assertEqual(len(findings), 1)
+        self.assertIn("without resolvable prior", findings[0].title)
+
+    def test_explicit_retry_accepts_matching_trace_ids(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/retry_lineage.jsonl")))
+        for record in records[:2]:
+            record["run"]["trace_id"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        findings = [f for f in analyze(records).findings if f.category == "retry_overhead"]
+        self.assertEqual(len(findings), 1)
+        self.assertIn("same failed/unknown tool call", findings[0].title)
+
+    def test_retry_record_id_from_different_run_is_unresolved(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/retry_lineage.jsonl")))
+        records[0]["run"]["run_id"] = "other-run"
+        # The retry points to a real record ID but not one in its run.
+        findings = [f for f in analyze(records).findings if f.category == "retry_overhead"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertIn("without resolvable prior", findings[0].title)
+        self.assertEqual(findings[0].saving_ratio, 0.0)
+
+    def test_retry_span_id_from_different_run_is_unresolved(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/retry_lineage.jsonl")))
+        records[1]["attribution"]["labels"]["retry_of"] = records[0]["run"]["span_id"]
+        records[0]["run"]["run_id"] = "other-run"
+        findings = [f for f in analyze(records).findings if f.category == "retry_overhead"]
+        self.assertEqual(len(findings), 1)
+        self.assertIn("without resolvable prior", findings[0].title)
+
+    def test_duplicate_prior_record_id_is_not_arbitrarily_resolved(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/retry_lineage.jsonl")))
+        other = copy.deepcopy(records[0])
+        other["run"]["span_id"] = "other-span"
+        records.append(other)
+        findings = [f for f in analyze(records).findings if f.category == "retry_overhead"]
+        self.assertEqual(len(findings), 1)
+        self.assertIn("without resolvable prior", findings[0].title)
+
+    def test_retry_reference_to_future_record_is_unresolved(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/retry_lineage.jsonl")))
+        records[0]["timing"]["event_time"] = "2026-10-08T02:00:04.000Z"
+        findings = [f for f in analyze(records).findings if f.category == "retry_overhead"]
+        self.assertEqual(len(findings), 1)
+        self.assertIn("without resolvable prior", findings[0].title)
+
+    def test_record_id_from_another_run_does_not_match_same_run_span(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/retry_lineage.jsonl")))
+        cross_run = copy.deepcopy(records[0])
+        cross_run["record_id"] = "ambiguous-link"
+        cross_run["run"]["run_id"] = "other-run"
+        records[0]["run"]["span_id"] = "ambiguous-link"
+        records[1]["attribution"]["labels"]["retry_of"] = "ambiguous-link"
+        records.append(cross_run)
+        findings = [f for f in analyze(records).findings if f.category == "retry_overhead"]
+        self.assertEqual(len(findings), 1)
+        self.assertIn("without resolvable prior", findings[0].title)
 
     def test_fingerprint_findings_do_not_claim_savings(self):
         report = analyze(load_records(str(ROOT / "samples/tool_fingerprints.jsonl")))
@@ -304,6 +506,78 @@ class AnalyzerTests(unittest.TestCase):
         for finding in report.findings:
             if finding.category == "freshness_refresh":
                 self.assertEqual(finding.saving_ratio, 0)
+
+    def test_reused_run_id_different_traces_does_not_invent_model_duplicate_savings(self):
+        base = load_records(str(ROOT / "samples/simple.jsonl"))[0]
+        records = []
+        for idx, trace in enumerate(("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), 1):
+            record = copy.deepcopy(base)
+            record["record_id"] = f"model-scope-{idx}"
+            record["run"]["span_id"] = f"model-span-{idx}"
+            record["run"]["trace_id"] = trace
+            record["run"]["step"] = idx
+            records.append(record)
+        report = analyze(records)
+        self.assertEqual(report.runs, 2)
+        self.assertEqual(report.category_counts["duplicate_repeated"], 0)
+        self.assertEqual(report.potential_savings.get("USD", 0), 0)
+
+        records[1]["run"]["trace_id"] = records[0]["run"]["trace_id"]
+        same_trace = analyze(records)
+        self.assertEqual(same_trace.runs, 1)
+        self.assertEqual(same_trace.category_counts["duplicate_repeated"], 1)
+        self.assertAlmostEqual(same_trace.potential_savings["USD"], 0.002)
+
+        # One known and one unknown trace cannot prove a shared execution.
+        records[1]["run"].pop("trace_id")
+        incomplete_trace = analyze(records)
+        self.assertEqual(incomplete_trace.runs, 2)
+        self.assertEqual(incomplete_trace.category_counts["duplicate_repeated"], 0)
+        self.assertEqual(incomplete_trace.potential_savings.get("USD", 0), 0)
+
+    def test_cross_trace_model_context_is_not_combined(self):
+        base = load_records(str(ROOT / "samples/simple.jsonl"))[0]
+        records = []
+        for idx, (trace, tokens) in enumerate((
+            ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 600),
+            ("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 2600),
+        ), 1):
+            record = copy.deepcopy(base)
+            record["record_id"] = f"context-scope-{idx}"
+            record["run"]["span_id"] = f"context-span-{idx}"
+            record["run"]["trace_id"] = trace
+            record["run"]["step"] = idx
+            record["usage"]["llm"]["input_tokens"] = tokens
+            records.append(record)
+        self.assertEqual(analyze(records).category_counts["context_amplification"], 0)
+        records[1]["run"]["trace_id"] = records[0]["run"]["trace_id"]
+        self.assertGreater(analyze(records).category_counts["context_amplification"], 0)
+
+    def test_cross_trace_model_call_count_is_not_orchestration_overhead(self):
+        base = load_records(str(ROOT / "samples/simple.jsonl"))[0]
+        records = []
+        for idx in range(6):
+            record = copy.deepcopy(base)
+            record["record_id"] = f"orchestration-scope-{idx}"
+            record["run"]["span_id"] = f"orchestration-span-{idx}"
+            record["run"]["step"] = idx + 1
+            record["run"]["trace_id"] = ("a" if idx < 3 else "b") * 32
+            records.append(record)
+        self.assertEqual(analyze(records).category_counts["orchestration_overhead"], 0)
+        for record in records:
+            record["run"]["trace_id"] = "a" * 32
+        self.assertEqual(analyze(records).category_counts["orchestration_overhead"], 2)
+
+    def test_cross_trace_high_context_does_not_invent_cache_persistence(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/cache_instability.jsonl")))
+        for idx, record in enumerate(records):
+            record["run"]["trace_id"] = f"{idx + 1:032x}"
+        report = analyze(records)
+        self.assertEqual(report.runs, 3)
+        self.assertEqual(report.category_counts["context_amplification"], 0)
+        for record in records:
+            record["run"]["trace_id"] = "a" * 32
+        self.assertGreater(analyze(records).category_counts["context_amplification"], 0)
 
     def test_savings_do_not_exceed_observed_cost(self):
         report = analyze(load_records(str(ROOT / "samples/inefficient_agent.jsonl")))

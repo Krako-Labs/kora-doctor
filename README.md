@@ -4,7 +4,7 @@
 
 AUDR can tell you what an agent ran and what it cost. KORA Doctor asks the next question:
 
-> **Which parts of that execution should disappear?**
+> **Which steps deserve closer inspection?**
 
 KORA Doctor is a small open-source CLI that analyzes [AUDR](https://openaudr.dev/) JSON/JSONL and surfaces waste across tool usage, context growth, deterministic work, repeated inference, orchestration, and model choice.
 
@@ -12,18 +12,37 @@ No dashboard. No account. No hosted service.
 
 ![KORA Doctor terminal demo](assets/demo.svg)
 
+## Contents
+
+- [Quick start](#quick-start) — run a local audit in one command
+- [What it looks for](#what-it-looks-for) — diagnostic signals and their limits
+- [OTel sidecar enrichment](#otel-sidecar-enrichment) — optional execution evidence
+- [AUDR compatibility](#audr-compatibility) — supported input format
+- [Share a real trace](#share-a-real-trace) — safe validation and feedback
+- [Local development](#local-development) — install and run tests
+- [Limitations](#limitations) — what a finding cannot prove
+
 ## Quick start
 
-Install directly from GitHub:
+Install the current release from GitHub (Python 3.9+):
 
 ```bash
-pipx install git+https://github.com/Krako-Labs/kora-doctor.git
+pipx install --force git+https://github.com/Krako-Labs/kora-doctor.git@v0.1.11
+kora-doctor demo
 ```
 
-Then audit an AUDR file:
+The demo runs locally using **bundled synthetic data**, with no account, API key, network request, or trace export. It demonstrates diagnostic candidates, **not actual cost savings** or permission to delete calls.
+
+Audit your own AUDR file:
 
 ```bash
 kora-doctor audit audr.jsonl
+```
+
+See all commands:
+
+```bash
+kora-doctor --help
 ```
 
 From a clone:
@@ -44,6 +63,10 @@ With an OTel sidecar:
 kora-doctor audit samples/otel_audr.jsonl --otel samples/otel_sidecar.json
 ```
 
+Both input files must be UTF-8 encoded. Invalid JSON, non-finite AUDR numbers (`NaN`, `Infinity` or numeric overflow), encoding, OTel span containers, OTel attribute structures, or duplicate AUDR `record_id` values return exit code `2` with a short error on stderr. Duplicate IDs are rejected across the whole input, even when run or trace IDs differ, because a collision can assign a finding to the wrong call's cost. KORA Doctor does not print raw trace values or a Python traceback for these input errors.
+
+OTel sidecars support OTLP `resourceSpans`, a `spans` array, or a top-level array of spans. Valid empty span arrays are accepted. Malformed attributes are rejected even in spans that do not match an AUDR record. OTLP `arrayValue` / `kvlistValue` entries must have valid nested `AnyValue` objects; duplicate attribute keys are rejected. Scalar `AnyValue` fields must match their OTLP types (`intValue` accepts decimal int64 strings; `bytesValue` accepts base64). Simpler JSON attribute maps remain supported. For safety, sidecars with more than 128 nested JSON object/array levels are rejected instead of attempting an unbounded recursive decode. Equivalent OTLP numeric and base64 scalar encodings are normalized before argument fingerprinting; raw arguments and byte payloads are not stored in the report.
+
 ## Example
 
 The v0.1.1 harness sample is synthetic and exists to exercise the heuristics. It is not a benchmark.
@@ -52,10 +75,10 @@ The v0.1.1 harness sample is synthetic and exists to exercise the heuristics. It
 KORA Doctor
 Find execution waste in AI agent runs.
 
-Observed: 7 records · 1 runs · 5 model calls · 2 tool calls
+Observed: 7 records · 1 run · 5 model calls · 2 tool calls
 Observed cost:                      $0.0660
-Potentially avoidable:              $0.0130  (20%)
-Estimated optimized cost:           $0.0530
+Illustrative savings:              $0.0130  (20%)
+Illustrative remainder:           $0.0530
 
 Execution waste candidates
 -----------------------------------------------
@@ -82,8 +105,8 @@ KORA Doctor now prioritizes execution waste before model downsizing:
 - **Context amplification** — input-token growth that can indicate carried retrieval results, growing context, or repeated static tool definitions.
 - **Prompt cache efficiency** — observed cache-read share from AUDR cache counters, surfaced without assuming one universal 'good' threshold.
 - **Deterministic validation** — validation/schema/format work that may belong in JSON Schema, parsing, or ordinary code instead of an LLM.
-- **Repeated inference** — model/resource and usage signatures repeating inside a run.
-- **Cross-run reuse candidates** — similar signatures appearing across multiple runs.
+- **Repeated inference** — model/resource and usage signatures repeating inside one execution, scoped by `run_id` and `trace_id` when available.
+- **Cross-run reuse candidates** — similar signatures appearing across multiple reported run IDs.
 - **Suspicious orchestration overhead** — long model-call chains that deserve inspection.
 - **Smaller-model candidates** — considered after execution waste is removed.
 
@@ -115,7 +138,7 @@ KORA Doctor therefore uses:
 - **confidence** for heuristic strength
 - **insufficient evidence** where the trace cannot support a stronger conclusion
 
-Savings are only calculated when `cost.total_cost` is present. Multiple currencies are never silently converted.
+Savings are only calculated when `cost.total_cost` is present. Multiple currencies are never silently converted. **Illustrative savings are not measured savings.** Do not remove or reroute calls without replay and quality checks. In `--json`, the existing `potential_savings` and `estimated_optimized_costs` keys are preserved for compatibility, and `savings_basis=illustrative_heuristic_not_measured` explicitly marks their meaning.
 
 ### Current savings assumptions
 
@@ -146,7 +169,7 @@ AUDR intentionally avoids raw tool arguments and results. KORA Doctor can still 
 }
 ```
 
-When the same tool repeats in one run:
+When the same tool repeats in one run (and the same trace, if trace IDs are available):
 
 - same tool, no fingerprint -> low-confidence repeat candidate
 - same tool + same `tool_args_hash` -> medium-confidence same-argument repeat
@@ -174,6 +197,12 @@ When matching spans are found by `span_id` / `trace_id`, KORA Doctor can enrich 
 - inferred retry lineage when the same hashed tool call follows an explicit failed/timeout/unknown span
 
 Raw tool arguments and results are hashed in memory and are not copied into the KORA Doctor report.
+
+OTel matching is conservative. When both sides report trace IDs, they must agree. A repeated or ambiguous span match is ignored rather than assigning status or argument evidence to the wrong run. A unique span can still match when AUDR has no trace ID. Existing optional AUDR labels are preserved.
+
+If AUDR and OTel disagree about a matching record's status, argument fingerprint, retry link, or other imported label, Doctor skips **all OTel enrichment for that record**. It keeps the original AUDR fields and reports the count of skipped source conflicts in CLI warnings. A conflict is not evidence that one source is correct or that the operation can be removed.
+
+Inferred retry links require one run, one trace, unique record IDs, **OTel-observed argument fingerprints for both calls and an OTel-observed failure on the earlier call**, and strictly ordered, timezone-aware timestamps. AUDR-only hashes, statuses, or ID-matched empty spans do not establish OTel-inferred retry evidence. These links carry a `retry_inferred_by_otel` marker and remain low-confidence candidates. Only **explicit** retry links can group HTTP 429 attempts into one logical operation. Neither form alone proves an avoidable retry or cost savings.
 
 This keeps AUDR as the portable usage/cost layer while letting OTel/traceAI provide stronger execution evidence.
 
@@ -218,9 +247,18 @@ AUDR v1.0.0 has run-level errors and outcomes, but not per-operation retry linea
 }
 ```
 
-KORA Doctor resolves `retry_of` against either a prior `record_id` or `span_id`. Confidence increases when retry lineage, matching argument fingerprints, and prior per-operation status all agree.
+KORA Doctor resolves `retry_of` against either a prior `record_id` or `span_id` only within the same run and matching trace identity (if both trace IDs are absent, that is treated as one unknown trace domain). If one record has a trace ID and the other does not, or the trace IDs disagree, Doctor does not connect them. Confidence increases when retry lineage, matching argument fingerprints, and prior per-operation status all agree.
 
 A retry is reported as overhead evidence, not automatically as removable waste. Timeouts, idempotency, and unknown remote outcomes can make a retry necessary.
+
+### HTTP 429 retry chains (advisory)
+
+When an instrumented AUDR record or matched OTel span includes `http_status_code` (or `http.response.status_code` / `http.status_code`), Doctor also recognizes **linear chains of explicit retries** if every link stays in one run, uses matching tool/argument fingerprints, and has ordered timestamps.
+
+For example, three HTTP 429 attempts followed by HTTP 200 produce **one chain finding with four attempts**, not four independent failed logical operations. The finding reports the observed number of rate-limit responses and the last known outcome. Chains without explicit retry links, with ambiguous/branching lineage, or without matching argument fingerprints are not grouped. Attempts after the root of a confirmed HTTP 429 chain are **not also counted as repeated tool/read waste candidates**. A separate, unlinked call to the same tool can still be reported as a repeat.
+
+This is a candidate-level diagnostic and claims **no savings**. HTTP status alone does not prove why a retry was scheduled. Doctor does not copy raw Retry-After or rate-limit headers into its report, and does not claim a header conflict from status codes alone. If the final HTTP status is missing, the outcome remains uncertain. This lightweight instrumentation is optional and does not change the AUDR v1.0.0 schema.
+
 
 ## Prompt cache metrics
 
@@ -246,6 +284,10 @@ It checks the core fields needed for analysis, but it is **not** a replacement f
 
 AUDR upstream currently provides adapters for LiteLLM, Vercel AI SDK, Mastra, NVIDIA NeMo Relay, and Merge Gateway, plus sinks including Chargebee.
 
+## Share a real trace
+
+A real, correctly sanitized trace is more useful than another synthetic test. The tool runs locally, but **neither the AUDR input nor the `--json` report is automatically anonymized**. Follow the [real trace intake and privacy guide](docs/REAL_TRACE_INTAKE.md) before sharing anything to [Issue #8](https://github.com/Krako-Labs/kora-doctor/issues/8).
+
 ## Samples
 
 ```bash
@@ -256,6 +298,7 @@ python3 -m kora_doctor audit samples/harness_waste.jsonl
 python3 -m kora_doctor audit samples/cache_instability.jsonl
 python3 -m kora_doctor audit samples/tool_fingerprints.jsonl
 python3 -m kora_doctor audit samples/retry_lineage.jsonl
+python3 -m kora_doctor audit samples/http_429_retry_chain.jsonl
 python3 -m kora_doctor audit samples/unused_work.jsonl
 ```
 

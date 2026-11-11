@@ -16,14 +16,18 @@ KORA Doctor is a small open-source CLI that reads AUDR JSON/JSONL and flags dupl
 
 It deliberately uses heuristics first. AUDR does not contain prompt bodies, so KORA Doctor reports candidates with confidence levels rather than pretending it can prove a call was unnecessary.
 
-Quick try:
+Quick try with the current public build (no account needed):
 
-    pipx install git+https://github.com/Krako-Labs/kora-doctor.git
-    kora-doctor audit samples/inefficient_agent.jsonl
+    pipx install --force git+https://github.com/Krako-Labs/kora-doctor.git@v0.1.11
+    kora-doctor demo
+    curl -fsSL https://raw.githubusercontent.com/Krako-Labs/kora-doctor/main/samples/inefficient_agent.jsonl -o kora-doctor-example.jsonl
+    kora-doctor audit ./kora-doctor-example.jsonl
+
+`pipx` installs the CLI, not the repository's sample files. This example downloads a synthetic fixture separately. All findings are diagnostic candidates; estimated savings are illustrative, not verified. The `demo` command ships with v0.1.11 and uses bundled synthetic fixture data.
 
 GitHub: https://github.com/Krako-Labs/kora-doctor
 
-I’d especially like real AUDR traces that expose false positives or missing heuristics.
+I’m looking for reproducible false positives or carefully scrubbed AUDR traces. Review the data locally before sharing; never post prompts, customer data, raw tool payloads, tokens, or private URLs. Intake checklist: https://github.com/Krako-Labs/kora-doctor/issues/8
 
 ## X
 
@@ -52,6 +56,6 @@ The problem I’m testing: observability can tell us where tokens and dollars we
 
 KORA Doctor reads AUDR JSON/JSONL and surfaces optimization candidates using deliberately simple heuristics. No dashboard, account, or hosted service.
 
-I’m looking for real traces where the heuristics are clearly wrong or miss something obvious. That feedback is more useful right now than feature requests for a bigger platform.
+I’m looking for reproducible false positives or sanitized traces where the heuristics are wrong or miss something obvious. Never share raw prompts, tool payloads, customer data, tokens or private URLs. Trace intake: https://github.com/Krako-Labs/kora-doctor/issues/8. That evidence is more useful right now than feature requests for a bigger platform.
 
 Repo: https://github.com/Krako-Labs/kora-doctor

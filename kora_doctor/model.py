@@ -53,6 +53,7 @@ class AuditReport:
             "runs": self.runs,
             "observed_costs": self.observed_costs,
             "potential_savings": self.potential_savings,
+            "savings_basis": "illustrative_heuristic_not_measured",
             "estimated_optimized_costs": optimized,
             "potential_savings_percent": percentages,
             "category_counts": self.category_counts,

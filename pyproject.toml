@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kora-doctor"
-version = "0.1.10"
+version = "0.1.11"
 description = "Find the LLM calls your AI agent may never have needed."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -34,3 +34,6 @@ Issues = "https://github.com/Krako-Labs/kora-doctor/issues"
 
 [tool.setuptools.packages.find]
 include = ["kora_doctor*"]
+
+[tool.setuptools.package-data]
+kora_doctor = ["data/*.jsonl"]
