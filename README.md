@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://github.com/Krako-Labs/kora-doctor/releases/tag/v0.1.11"><img src="https://img.shields.io/github/v/release/Krako-Labs/kora-doctor?style=flat-square&amp;label=release&amp;color=05264B" alt="Release" /></a>
   <img src="https://img.shields.io/badge/Python-3.9%2B-3776AB?style=flat-square" alt="Python 3.9+" />
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/Krako-Labs/kora-doctor?style=flat-square&amp;color=E85B50" alt="Apache-2.0 license" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-E85B50?style=flat-square" alt="Apache-2.0 license" /></a>
   <img src="https://img.shields.io/badge/AUDR-v1.0.0-07897B?style=flat-square" alt="AUDR v1.0.0" />
   <img src="https://img.shields.io/badge/OTel-optional-7952B3?style=flat-square" alt="OTel optional" />
   <img src="https://img.shields.io/badge/demo-offline-176B50?style=flat-square" alt="Offline demo" />
