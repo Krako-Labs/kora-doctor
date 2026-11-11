@@ -8,6 +8,7 @@ from .model import AuditReport, Finding
 
 CATEGORY_REPEATED_TOOL = "repeated_tool_retrieval"
 CATEGORY_RETRY = "retry_overhead"
+CATEGORY_RATE_LIMIT = "rate_limit_retry_chain"
 CATEGORY_UNUSED = "unused_work"
 CATEGORY_CONTEXT = "context_amplification"
 CATEGORY_DUPLICATE = "duplicate_repeated"
@@ -64,6 +65,12 @@ OPERATION_STATUS_LABELS = (
     "operation_status",
     "tool_status",
     "kora.operation_status",
+)
+
+HTTP_STATUS_LABELS = (
+    "http_status_code",
+    "http.response.status_code",
+    "http.status_code",
 )
 
 OUTPUT_CONSUMED_LABELS = (
@@ -188,6 +195,14 @@ def _retry_attempt(record: Dict[str, Any]):
 def _operation_status(record: Dict[str, Any]):
     value = _label_fingerprint(record, OPERATION_STATUS_LABELS)
     return value.lower() if isinstance(value, str) else None
+
+
+def _http_status(record: Dict[str, Any]):
+    value = _label_fingerprint(record, HTTP_STATUS_LABELS)
+    if value is None or not value.isdecimal():
+        return None
+    status = int(value)
+    return status if 100 <= status <= 599 else None
 
 
 def _label_bool(record: Dict[str, Any], names: Tuple[str, ...]):
@@ -315,10 +330,17 @@ def _parsed_event_time(record: Dict[str, Any]):
         return None
 
 
+def _trace_id(record: Dict[str, Any]) -> str:
+    # OTel trace IDs are hex strings; allow normalized UUID punctuation.
+    value = record.get("run", {}).get("trace_id")
+    return str(value).strip().lower().replace("-", "") if value is not None else ""
+
+
 def analyze(records: List[Dict[str, Any]]) -> AuditReport:
     model_records = [r for r in records if _is_model(r)]
     tool_records = [r for r in records if not _is_model(r)]
-    runs = {str(r.get("run", {}).get("run_id")) for r in records}
+    # A reused run_id in distinct OTel traces is not one logical execution.
+    runs = {(str(r.get("run", {}).get("run_id")), _trace_id(r)) for r in records}
 
     observed_costs = defaultdict(float)
     warnings: List[str] = []
@@ -368,125 +390,19 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
 
     findings: List[Finding] = []
 
-    # 1. Repeated tool/resource use inside one run.
-    #
-    # AUDR intentionally does not include tool arguments/results. When a trace
-    # source supplies privacy-preserving hashes in attribution.labels, use those
-    # as stronger evidence. Otherwise keep the old resource-only heuristic.
-    by_run_tool = defaultdict(list)
-    for record in tool_records:
-        run_id = str(record["run"]["run_id"])
-        by_run_tool[(run_id, _tool_signature(record))].append(record)
-
-    for (run_id, _), group in by_run_tool.items():
-        if len(group) < 2:
-            continue
-
-        ordered = _ordered(group)
-        resource_name = str(ordered[0].get("resource", {}).get("name", "tool"))
-
-        by_args_hash = defaultdict(list)
-        without_args_hash = []
-        for record in ordered:
-            args_hash = _tool_args_hash(record)
-            if args_hash:
-                by_args_hash[args_hash].append(record)
-            else:
-                without_args_hash.append(record)
-
-        exact_groups = [records for records in by_args_hash.values() if len(records) >= 2]
-        if exact_groups:
-            for exact_group in exact_groups:
-                duplicates = exact_group[1:]
-                result_hashes = [_tool_result_hash(record) for record in exact_group]
-                nonempty_results = [value for value in result_hashes if value]
-                same_result = (
-                    len(nonempty_results) == len(exact_group)
-                    and len(set(nonempty_results)) == 1
-                )
-
-                if same_result:
-                    title = f"{len(duplicates)} exact repeated tool call(s): {resource_name}"
-                    reason = (
-                        "The same tool/resource repeated in one run with the same argument fingerprint "
-                        "and the same result fingerprint. This is strong evidence of repeated work, "
-                        "though freshness or safety checks may still justify the second call."
-                    )
-                else:
-                    title = f"{len(duplicates)} same-argument tool call(s): {resource_name}"
-                    reason = (
-                        "The same tool/resource repeated in one run with the same argument fingerprint. "
-                        "This is stronger evidence than a resource-name match alone, but changing external "
-                        "state can still make a repeated read legitimate."
-                    )
-
-                findings.append(
-                    Finding(
-                        category=CATEGORY_REPEATED_TOOL,
-                        title=title,
-                        reason=reason,
-                        confidence="medium",
-                        record_ids=[str(record["record_id"]) for record in duplicates],
-                        run_ids=[run_id],
-                        saving_ratio=0.0,
-                    )
-                )
-
-            # Hashes were available, so do not downgrade distinct hashed calls
-            # into a generic duplicate merely because they used the same tool.
-            if len(without_args_hash) >= 2:
-                duplicates = without_args_hash[1:]
-                findings.append(
-                    Finding(
-                        category=CATEGORY_REPEATED_TOOL,
-                        title=f"{len(duplicates)} unverified repeated tool/read call(s): {resource_name}",
-                        reason=(
-                            "The same tool/resource repeated, but these calls did not carry an argument "
-                            "fingerprint. They remain low-confidence reuse candidates."
-                        ),
-                        confidence="low",
-                        record_ids=[str(record["record_id"]) for record in duplicates],
-                        run_ids=[run_id],
-                        saving_ratio=0.0,
-                    )
-                )
-            continue
-
-        # No repeated argument fingerprint was available. If hashes exist but
-        # are all distinct, that is evidence these were different requests and
-        # we should not flag them as duplicates.
-        hashed = [record for record in ordered if _tool_args_hash(record)]
-        if hashed and not without_args_hash:
-            continue
-
-        duplicates = ordered[1:]
-        findings.append(
-            Finding(
-                category=CATEGORY_REPEATED_TOOL,
-                title=f"{len(duplicates)} repeated tool/read call(s): {resource_name}",
-                reason=(
-                    "The same AUDR tool/resource and operation repeated within one run. "
-                    "No repeated argument fingerprint was available, so this is an observed "
-                    "repeat and a reuse candidate, not proof that the second call was unnecessary."
-                ),
-                confidence="low",
-                record_ids=[str(record["record_id"]) for record in duplicates],
-                run_ids=[run_id],
-                saving_ratio=0.0,
-            )
-        )
-
-    # 2. Explicit retry lineage.
+    # 1. Explicit retry lineage.
     #
     # AUDR v1.0.0 has run-level error/outcome fields but no per-operation retry
     # lineage. Richer trace sources can preserve that evidence in labels.
-    record_by_record_id = {str(record.get("record_id")): record for record in records}
-    record_by_span_id = {
-        str(record.get("run", {}).get("span_id")): record
-        for record in records
-        if record.get("run", {}).get("span_id")
-    }
+    records_by_record_id = defaultdict(list)
+    records_by_span_id = defaultdict(list)
+    for record in records:
+        records_by_record_id[str(record.get("record_id"))].append(record)
+        span_id = record.get("run", {}).get("span_id")
+        if span_id:
+            records_by_span_id[str(span_id)].append(record)
 
+    resolved_retry_parents = {}
     for record in records:
         retry_ref = _retry_of(record)
         attempt = _retry_attempt(record)
@@ -495,7 +411,27 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
 
         previous = None
         if retry_ref:
-            previous = record_by_record_id.get(retry_ref) or record_by_span_id.get(retry_ref)
+            # A logical retry must belong to the same run. Neither record IDs
+            # nor span IDs are trustworthy links across run boundaries; also
+            # reject duplicates instead of guessing which parent was retried.
+            run_id = record.get("run", {}).get("run_id")
+            candidates = [
+                item for item in records_by_record_id.get(retry_ref, [])
+                if item is not record and item.get("run", {}).get("run_id") == run_id
+                and _trace_id(item) == _trace_id(record)
+            ]
+            if not candidates and retry_ref not in records_by_record_id:
+                candidates = [
+                    item for item in records_by_span_id.get(retry_ref, [])
+                    if item is not record and item.get("run", {}).get("run_id") == run_id
+                and _trace_id(item) == _trace_id(record)
+                ]
+            if len(candidates) == 1:
+                previous = candidates[0]
+                prev_time = _parsed_event_time(previous)
+                retry_time = _parsed_event_time(record)
+                if prev_time is not None and retry_time is not None and prev_time >= retry_time:
+                    previous = None
 
         if previous is None:
             findings.append(
@@ -514,14 +450,33 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
             )
             continue
 
+        # An OTel-derived guess is not an explicit retry edge. It can be a
+        # low-confidence candidate, but must not build an HTTP logical chain.
+        inferred_retry = _label_bool(record, ("retry_inferred_by_otel",)) is True
         same_tool = _tool_signature(previous) == _tool_signature(record)
         prev_args = _tool_args_hash(previous)
         curr_args = _tool_args_hash(record)
         same_args = bool(prev_args and curr_args and prev_args == curr_args)
         prev_status = _operation_status(previous)
+        prev_time = _parsed_event_time(previous)
+        curr_time = _parsed_event_time(record)
+        if (
+            retry_ref and not inferred_retry and same_tool and same_args
+            and prev_time is not None and curr_time is not None and prev_time < curr_time
+            and len(records_by_record_id[str(record["record_id"])]) == 1
+            and len(records_by_record_id[str(previous["record_id"])]) == 1
+        ):
+            resolved_retry_parents[str(record["record_id"])] = str(previous["record_id"])
 
         confidence = "low"
-        if same_tool and same_args and prev_status in RETRY_PROBLEM_STATUSES:
+        if inferred_retry:
+            title = "Possible retry inferred from OTel tool-call evidence"
+            reason = (
+                "OTel-inferred matching tool and argument fingerprints, a prior problem "
+                "status, and time order suggest a retry. No explicit retry edge was observed, so this "
+                "does not establish one logical operation, unnecessary work, or savings."
+            )
+        elif same_tool and same_args and prev_status in RETRY_PROBLEM_STATUSES:
             confidence = "medium"
             title = "Retry replayed the same failed/unknown tool call"
             reason = (
@@ -558,6 +513,189 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
                 confidence=confidence,
                 record_ids=[str(record["record_id"])],
                 run_ids=[str(record["run"]["run_id"])],
+                saving_ratio=0.0,
+            )
+        )
+
+    # HTTP 429 is an attempt-level observation, not an independent
+    # logical-operation failure. Build only explicit, linear same-run retry
+    # chains with matching argument fingerprints and increasing timestamps.
+    # We do not inspect raw response headers or infer Retry-After conflicts.
+    successors = defaultdict(list)
+    for child_id, parent_id in resolved_retry_parents.items():
+        successors[parent_id].append(child_id)
+
+    for root_id in sorted(set(successors) - set(resolved_retry_parents)):
+        chain = [root_id]
+        current = root_id
+        while current in successors:
+            # Branches cannot safely be counted as one serial operation.
+            if len(successors[current]) != 1:
+                chain = []
+                break
+            child_id = successors[current][0]
+            if child_id in chain:
+                chain = []
+                break
+            chain.append(child_id)
+            current = child_id
+
+        if len(chain) < 2:
+            continue
+        events = [records_by_record_id[record_id][0] for record_id in chain]
+        codes = [_http_status(record) for record in events]
+        rate_limits = sum(code == 429 for code in codes)
+        if rate_limits == 0:
+            continue
+
+        last_code = codes[-1]
+        final_status = _operation_status(events[-1])
+        # An HTTP result and a per-operation result may come from different
+        # instrumentation layers. Contradictions must not certify success.
+        contradictory_status = any(
+            (code == 429 and _operation_status(event) in RETRY_SUCCESS_STATUSES)
+            or (code is not None and 200 <= code < 300
+                and _operation_status(event) in RETRY_PROBLEM_STATUSES)
+            for code, event in zip(codes, events)
+        )
+        if contradictory_status:
+            outcome = "conflicting HTTP and operation statuses; final outcome not established"
+        elif last_code is not None and 200 <= last_code < 300:
+            outcome = "eventual HTTP success"
+        elif last_code == 429:
+            outcome = "last observed attempt still rate-limited"
+        elif last_code is None and final_status in RETRY_SUCCESS_STATUSES:
+            outcome = "reported success without an HTTP status"
+        else:
+            outcome = "final outcome not established"
+
+        findings.append(
+            Finding(
+                category=CATEGORY_RATE_LIMIT,
+                title=f"HTTP 429 retry chain: {len(chain)} attempts, {rate_limits} rate-limit response(s)",
+                reason=(
+                    f"One explicit, same-run, same-argument retry chain contains {len(chain)} "
+                    f"observed attempts, including {rate_limits} HTTP 429 response(s); {outcome}. "
+                    "Attempts are not counted as independent failed logical operations. "
+                    "Raw Retry-After and rate-limit headers are not available, so this does not "
+                    "prove a header conflict or that any retry was unnecessary."
+                ),
+                confidence="medium" if all(code is not None for code in codes) and not contradictory_status else "low",
+                record_ids=chain,
+                run_ids=[str(events[0]["run"]["run_id"])],
+                saving_ratio=0.0,
+            )
+        )
+
+    # A complete explicit 429 chain already explains these later attempts.
+    # Do not also report them as duplicate tool/read waste candidates.
+    # Keep the chain root so independent subsequent reads can still be flagged.
+    rate_limit_retry_ids = {
+        record_id
+        for finding in findings if finding.category == CATEGORY_RATE_LIMIT
+        for record_id in finding.record_ids[1:]
+    }
+
+    # 2. Repeated tool/resource use inside one run.
+    #
+    # AUDR intentionally does not include tool arguments/results. When a trace
+    # source supplies privacy-preserving hashes in attribution.labels, use those
+    # as stronger evidence. Otherwise keep the old resource-only heuristic.
+    by_run_tool = defaultdict(list)
+    for record in tool_records:
+        if str(record["record_id"]) in rate_limit_retry_ids:
+            continue  # Already represented as an explicit HTTP 429 retry attempt.
+        run_id = str(record["run"]["run_id"])
+        # Reused run IDs do not establish a shared execution across distinct traces.
+        by_run_tool[(run_id, _trace_id(record), _tool_signature(record))].append(record)
+
+    for (run_id, _, _), group in by_run_tool.items():
+        if len(group) < 2:
+            continue
+
+        ordered = _ordered(group)
+        resource_name = str(ordered[0].get("resource", {}).get("name", "tool"))
+
+        by_args_hash = defaultdict(list)
+        without_args_hash = []
+        for record in ordered:
+            args_hash = _tool_args_hash(record)
+            if args_hash:
+                by_args_hash[args_hash].append(record)
+            else:
+                without_args_hash.append(record)
+
+        exact_groups = [items for items in by_args_hash.values() if len(items) >= 2]
+        for exact_group in exact_groups:
+            duplicates = exact_group[1:]
+            result_hashes = [_tool_result_hash(record) for record in exact_group]
+            same_result = all(result_hashes) and len(set(result_hashes)) == 1
+
+            if same_result:
+                title = f"{len(duplicates)} exact repeated tool call(s): {resource_name}"
+                reason = (
+                    "The same tool/resource repeated in one run with the same argument fingerprint "
+                    "and the same result fingerprint. This is strong evidence of repeated work, "
+                    "though freshness or safety checks may still justify the second call."
+                )
+            else:
+                title = f"{len(duplicates)} same-argument tool call(s): {resource_name}"
+                reason = (
+                    "The same tool/resource repeated in one run with the same argument fingerprint. "
+                    "This is stronger evidence than a resource-name match alone, but changing external "
+                    "state can still make a repeated read legitimate."
+                )
+
+            findings.append(
+                Finding(
+                    category=CATEGORY_REPEATED_TOOL,
+                    title=title,
+                    reason=reason,
+                    confidence="medium",
+                    record_ids=[str(record["record_id"]) for record in duplicates],
+                    run_ids=[run_id],
+                    saving_ratio=0.0,
+                )
+            )
+
+        if by_args_hash:
+            # Known-distinct hashes are *not* duplicate candidates merely
+            # because another call in the group is missing a fingerprint.
+            # Attribute uncertainty only to later uninstrumented calls.
+            unverified = [record for record in ordered[1:] if not _tool_args_hash(record)]
+            if unverified:
+                findings.append(
+                    Finding(
+                        category=CATEGORY_REPEATED_TOOL,
+                        title=f"{len(unverified)} unverified repeated tool/read call(s): {resource_name}",
+                        reason=(
+                            "Some calls lack argument fingerprints. Only those later uninstrumented "
+                            "calls are flagged as low-confidence reuse candidates; calls with distinct "
+                            "argument fingerprints are not marked as duplicates."
+                        ),
+                        confidence="low",
+                        record_ids=[str(record["record_id"]) for record in unverified],
+                        run_ids=[run_id],
+                        saving_ratio=0.0,
+                    )
+                )
+            continue
+
+        # With no hashes available, metadata can suggest a repeated resource
+        # but cannot establish identical arguments or unnecessary execution.
+        duplicates = ordered[1:]
+        findings.append(
+            Finding(
+                category=CATEGORY_REPEATED_TOOL,
+                title=f"{len(duplicates)} repeated tool/read call(s): {resource_name}",
+                reason=(
+                    "The same AUDR tool/resource and operation repeated within one run. "
+                    "No argument fingerprints were available, so this is an observed "
+                    "repeat and a reuse candidate, not proof that the second call was unnecessary."
+                ),
+                confidence="low",
+                record_ids=[str(record["record_id"]) for record in duplicates],
+                run_ids=[run_id],
                 saving_ratio=0.0,
             )
         )
@@ -698,9 +836,9 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
     by_run_signature = defaultdict(list)
     for record in model_records:
         run_id = str(record["run"]["run_id"])
-        by_run_signature[(run_id, _usage_signature(record))].append(record)
+        by_run_signature[(run_id, _trace_id(record), _usage_signature(record))].append(record)
 
-    for (run_id, _), group in by_run_signature.items():
+    for (run_id, _, _), group in by_run_signature.items():
         if len(group) >= 2:
             duplicates = _ordered(group)[1:]
             findings.append(
@@ -785,9 +923,9 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
     # 5. Context amplification and repeated static-context tax.
     by_run_models = defaultdict(list)
     for record in model_records:
-        by_run_models[str(record["run"]["run_id"])].append(record)
+        by_run_models[(str(record["run"]["run_id"]), _trace_id(record))].append(record)
 
-    for run_id, group in by_run_models.items():
+    for (run_id, _trace), group in by_run_models.items():
         ordered = _ordered(group)
         previous = None
         growth_records = []
@@ -921,7 +1059,7 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
                 )
 
     # 6. Suspicious orchestration overhead.
-    for run_id, group in by_run_models.items():
+    for (run_id, _trace), group in by_run_models.items():
         ordered = _ordered(group)
         if len(ordered) >= 6:
             extras = ordered[4:]
@@ -990,6 +1128,8 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
     category_counts = {
         CATEGORY_REPEATED_TOOL: len(category_record_ids[CATEGORY_REPEATED_TOOL]),
         CATEGORY_RETRY: len(category_record_ids[CATEGORY_RETRY]),
+        # This category counts logical chains, not individual attempt records.
+        CATEGORY_RATE_LIMIT: sum(f.category == CATEGORY_RATE_LIMIT for f in findings),
         CATEGORY_UNUSED: len(category_record_ids[CATEGORY_UNUSED]),
         CATEGORY_CONTEXT: len(category_record_ids[CATEGORY_CONTEXT]),
         CATEGORY_DETERMINISTIC: len(category_record_ids[CATEGORY_DETERMINISTIC]),
