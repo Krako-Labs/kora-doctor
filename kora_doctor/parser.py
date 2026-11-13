@@ -36,6 +36,13 @@ def _validate_record(record: Any, index: int) -> Dict[str, Any]:
         raise InputError(
             f"record {index}: resource missing required field(s): {', '.join(missing_resource)}"
         )
+    # These fields participate in grouping keys and are resource identifiers,
+    # not structured data. An array/map would crash dictionary-key grouping.
+    for field in _REQUIRED_RESOURCE:
+        if not isinstance(resource[field], str):
+            raise InputError(f"record {index}: resource.{field} must be a string")
+    if resource.get("modality") is not None and not isinstance(resource["modality"], str):
+        raise InputError(f"record {index}: resource.modality must be a string")
 
     run = record.get("run")
     if not isinstance(run, dict):
@@ -44,9 +51,44 @@ def _validate_record(record: Any, index: int) -> Dict[str, Any]:
     if missing_run:
         raise InputError(f"record {index}: run missing required field(s): {', '.join(missing_run)}")
 
+    # Identifiers must not merge after numeric/bool-to-string coercion.
+    # Report only the field name, never the user's identifier value.
+    if not isinstance(record["record_id"], str) or not record["record_id"].strip():
+        raise InputError(f"record {index}: record_id must be a non-empty string")
+    for field in _REQUIRED_RUN:
+        if not isinstance(run[field], str) or not run[field].strip():
+            raise InputError(f"record {index}: run.{field} must be a non-empty string")
+    if "trace_id" in run and (
+        not isinstance(run["trace_id"], str)
+        or not run["trace_id"]
+        or run["trace_id"] != run["trace_id"].strip()
+    ):
+        # Analyzer normalizes canonical UUIDs, not opaque trace labels.
+        # Do not let leading/trailing whitespace create a false identity match.
+        raise InputError(f"record {index}: run.trace_id must be a non-empty string without surrounding whitespace")
+
+    # Optional step is an integer sequence index. Reject malformed values
+    # before mixed types reach the analyzer's ordered comparisons.
+    step = run.get("step")
+    if step is not None and (type(step) is not int or step < 0):
+        raise InputError(f"record {index}: run.step must be a non-negative integer")
+
     usage = record.get("usage")
     if not isinstance(usage, dict) or not usage:
         raise InputError(f"record {index}: usage must be a non-empty object")
+    # Optional usage sections are objects. Reject malformed containers early
+    # with field-only errors rather than traceback or private input content.
+    for section in ("llm", "tool"):
+        if section in usage and not isinstance(usage[section], dict):
+            raise InputError(f"record {index}: usage.{section} must be an object")
+    llm = usage.get("llm") or {}
+    for field in ("input_tokens", "output_tokens", "reasoning_tokens",
+                  "cache_read_tokens", "cache_write_tokens", "requests"):
+        if isinstance(llm.get(field), (dict, list)):
+            raise InputError(f"record {index}: usage.llm.{field} must be a scalar value")
+    tool = usage.get("tool") or {}
+    if isinstance(tool.get("type"), (dict, list)):
+        raise InputError(f"record {index}: usage.tool.type must be a scalar value")
 
     return record
 

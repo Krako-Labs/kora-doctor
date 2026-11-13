@@ -84,7 +84,7 @@ SYNTHETIC DEMO — example data, not live measurements.
 KORA Doctor
 Observed: 7 records · 1 run · 5 model calls · 2 tool calls
 Observed cost:                     $0.0660
-Illustrative savings:             $0.0130 (20%)
+Illustrative savings:             $0.0000 (0%)
 
 Execution waste candidates
 --------------------------------------------
@@ -95,12 +95,12 @@ Smaller-model candidates          2
 
 Top findings
 --------------------------------------------
-[MEDIUM] LLM used for deterministic validation
 [LOW   ] Repeated read: fetch_customer_profile
 [LOW   ] Input context amplification
+[LOW   ] Validation task may require judgment
 ```
 
-**Interpretation:** The report identifies where to investigate first. It does **not** establish that the flagged calls can safely be removed. The amounts above come from a synthetic fixture.
+**Interpretation:** The report identifies where to investigate first. The example attributes **no defensible savings** from metadata alone. **0% does not mean the run had no waste.** These are synthetic records; no flagged call is proven safe to remove.
 
 <br />
 

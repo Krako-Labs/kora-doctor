@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
 from .parser import InputError
+from .analyzer import _canonical_id
 
 
 _ARG_ATTRIBUTE_NAMES = (
@@ -74,6 +75,18 @@ def _labels_conflict(labels: Dict[str, Any], proposed: Dict[str, str]) -> bool:
             if existing is not None and str(existing).strip().lower() != str(value).strip().lower():
                 return True
     return False
+
+
+
+def _parse_otel_integer(raw: str) -> int:
+    # Keep OTLP numeric decoding bounded and consistent on Python 3.9/3.13.
+    # JSON may contain giant numeric literals even in unmatched OTel spans.
+    if len(raw) > 128:
+        raise InputError("invalid OTel JSON number: integer exceeds supported length")
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise InputError("invalid OTel JSON number: malformed integer") from exc
 
 
 def _validate_json_nesting(payload: Any, *, max_depth: int = 128) -> None:
@@ -260,14 +273,10 @@ def _iter_spans(payload: Any) -> Iterable[Dict[str, Any]]:
     raise InputError("invalid OTel structure: no supported span container found")
 
 
-def _normalize_id(value: Any) -> str:
-    if value is None:
-        return ""
-    text = str(value).strip().lower()
-    compact = text.replace("-", "")
-    if compact and all(ch in "0123456789abcdef" for ch in compact):
-        return compact
-    return text
+def _normalize_id(value: Any, *, trace: bool = False) -> str:
+    # Match the analyzer's identity boundary. 16-hex span IDs and 32-hex / UUID
+    # trace IDs are canonical; opaque identifiers must match byte-for-byte.
+    return _canonical_id(value, hex_length=32 if trace else 16)
 
 
 def _canonical_payload(value: Any) -> str:
@@ -275,8 +284,19 @@ def _canonical_payload(value: Any) -> str:
         stripped = value.strip()
         try:
             parsed = json.loads(stripped)
-        except (json.JSONDecodeError, TypeError):
-            return stripped
+        except (ValueError, TypeError):
+            # Raw tool text is byte-significant: do not trim it. Some valid
+            # numeric-looking strings exceed Python's integer digit limit;
+            # treat those as text rather than exposing a parser traceback.
+            return value
+        if not isinstance(parsed, (dict, list)):
+            # An OTel stringValue may contain `42`, `true`, `null`, or a
+            # quoted JSON string as literal tool text. Parsing these as JSON
+            # scalars can erase whitespace and even make a stringValue `42`
+            # identical to an intValue 42. Preserve its text and type.
+            return json.dumps(value, ensure_ascii=False)
+        # A JSON object/array string is structurally comparable regardless of
+        # key order or insignificant JSON formatting whitespace.
         return json.dumps(parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
@@ -345,7 +365,7 @@ def enrich_with_otel(records: List[Dict[str, Any]], path: str):
     if not p.exists() or not p.is_file():
         raise InputError(f"OTel sidecar not found: {path}")
     try:
-        payload = json.loads(p.read_text(encoding="utf-8"))
+        payload = json.loads(p.read_text(encoding="utf-8"), parse_int=_parse_otel_integer)
     except UnicodeDecodeError as exc:
         raise InputError("OTel sidecar must be UTF-8 encoded") from exc
     except json.JSONDecodeError as exc:
@@ -355,6 +375,24 @@ def enrich_with_otel(records: List[Dict[str, Any]], path: str):
 
     _validate_json_nesting(payload)
     spans = list(_iter_spans(payload))
+    # Validate identifiers even for unmatched spans. Coercing OTel numbers or
+    # booleans to strings could attach evidence to a different opaque AUDR ID.
+    for span in spans:
+        for key in ("spanId", "span_id", "traceId", "trace_id"):
+            if key in span and span[key] is not None and not isinstance(span[key], str):
+                raise InputError(f"invalid OTel structure: {key} must be a string")
+        # Both OTLP spellings may appear in one sidecar. Do not silently pick
+        # the first when they refer to different spans or traces.
+        for camel, snake, trace in (
+            ("spanId", "span_id", False),
+            ("traceId", "trace_id", True),
+        ):
+            if span.get(camel) is not None and span.get(snake) is not None:
+                if _normalize_id(span[camel], trace=trace) != _normalize_id(
+                    span[snake], trace=trace
+                ):
+                    kind = "trace" if trace else "span"
+                    raise InputError(f"invalid OTel structure: conflicting {kind} ID aliases")
     # Validate every exported span, including unmatched ones. Otherwise an
     # invalid sidecar can be silently reported as a successful zero-match run.
     attrs_by_span = {id(span): _attributes(span) for span in spans}
@@ -385,25 +423,21 @@ def enrich_with_otel(records: List[Dict[str, Any]], path: str):
         if not candidates:
             continue
 
-        trace_id = _normalize_id(span.get("traceId") or span.get("trace_id"))
+        trace_id = _normalize_id(span.get("traceId") or span.get("trace_id"), trace=True)
         record = None
         if trace_id:
             exact = [
                 candidate for candidate in candidates
-                if _normalize_id(candidate.get("run", {}).get("trace_id")) == trace_id
+                if _normalize_id(candidate.get("run", {}).get("trace_id"), trace=True) == trace_id
             ]
             if len(exact) == 1:
                 record = exact[0]
-            elif not exact and len(candidates) == 1:
-                # Keep interoperability with AUDR records lacking trace_id,
-                # but never accept an explicitly different trace_id.
-                candidate = candidates[0]
-                if not _normalize_id(candidate.get("run", {}).get("trace_id")):
-                    record = candidate
         elif len(candidates) == 1:
-            # Span IDs can collide across runs/traces. Without a trace ID,
-            # ambiguous sidecar evidence must not be assigned arbitrarily.
-            record = candidates[0]
+            # Span IDs can collide across traces. With no sidecar trace ID,
+            # only a uniquely matching trace-less AUDR record is safe.
+            candidate = candidates[0]
+            if not _normalize_id(candidate.get("run", {}).get("trace_id"), trace=True):
+                record = candidate
 
         if record is None:
             continue
@@ -477,7 +511,7 @@ def enrich_with_otel(records: List[Dict[str, Any]], path: str):
             continue
         key = (
             str(run_id),
-            _normalize_id(run.get("trace_id")),
+            _normalize_id(run.get("trace_id"), trace=True),
         ) + _tool_key(record) + (str(args_hash),)
         by_operation.setdefault(key, []).append(record)
 

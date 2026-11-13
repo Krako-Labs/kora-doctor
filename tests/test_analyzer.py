@@ -18,12 +18,50 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(report.category_counts["smaller_model_candidate"], 0)
         self.assertEqual(report.category_counts["deterministic_candidate"], 0)
 
+    def test_boolean_cost_does_not_become_observed_money(self):
+        # In Python, bool is an int subclass; AUDR money still requires a number.
+        record = copy.deepcopy(load_records(str(ROOT / "samples/simple.jsonl"))[0])
+        for boolean in (True, False):
+            with self.subTest(value=boolean):
+                record["cost"] = {"total_cost": boolean, "currency": "USD"}
+                report = analyze([record])
+                self.assertNotIn("USD", report.observed_costs)
+                self.assertTrue(any("No AUDR cost.total_cost" in warning for warning in report.warnings))
+
+        record["cost"] = {"total_cost": 1.5, "currency": "USD"}
+        self.assertEqual(analyze([record]).observed_costs["USD"], 1.5)
+
+    def test_boolean_llm_counters_are_not_execution_evidence(self):
+        # JSON booleans are not numeric token telemetry even though bool extends int in Python.
+        record = copy.deepcopy(load_records(str(ROOT / "samples/simple.jsonl"))[0])
+        record["resource"]["name"] = "gpt-6"
+        record["run"]["name"] = "validate schema"
+        record["usage"]["llm"] = {
+            "input_tokens": True, "output_tokens": True, "reasoning_tokens": False,
+            "cache_read_tokens": True,
+        }
+        report = analyze([record])
+        self.assertEqual(report.category_counts["smaller_model_candidate"], 0)
+        self.assertNotIn("LLM used for deterministic validation", [f.title for f in report.findings])
+        self.assertEqual(report.cache_metrics, {})
+
+        # Well-formed counters still support cautious model and validation candidates.
+        record["usage"]["llm"] = {
+            "input_tokens": 150, "output_tokens": 20, "reasoning_tokens": 0,
+            "cache_read_tokens": 0,
+        }
+        valid = analyze([record])
+        self.assertEqual(valid.category_counts["smaller_model_candidate"], 1)
+        self.assertIn("LLM used for deterministic validation", [f.title for f in valid.findings])
+        self.assertEqual(valid.cache_metrics["read_share_percent"], 0.0)
+
     def test_inefficient_sample_surfaces_core_categories(self):
         report = analyze(load_records(str(ROOT / "samples/inefficient_agent.jsonl")))
         self.assertGreaterEqual(report.category_counts["duplicate_repeated"], 3)
         self.assertGreaterEqual(report.category_counts["deterministic_candidate"], 1)
         self.assertGreaterEqual(report.category_counts["orchestration_overhead"], 1)
-        self.assertGreater(report.potential_savings["USD"], 0)
+        self.assertGreater(report.observed_costs["USD"], 0)
+        self.assertEqual(report.potential_savings.get("USD", 0), 0)
 
 
     def test_harness_waste_sample_surfaces_user_requested_signals(self):
@@ -82,6 +120,121 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(findings[0].confidence, "low")
         self.assertEqual(findings[0].saving_ratio, 0.0)
 
+    def test_zero_based_step_order_preserves_context_growth_evidence(self):
+        # AUDR steps can start at zero. A zero step must not sort after step 2.
+        base = load_records(str(ROOT / "samples/simple.jsonl"))[0]
+        records = []
+        for step, input_tokens in ((0, 500), (1, 1400), (2, 1700)):
+            record = copy.deepcopy(base)
+            record["record_id"] = f"zero-step-{step}"
+            record["run"]["span_id"] = f"zero-span-{step}"
+            record["run"]["step"] = step
+            record["usage"]["llm"]["input_tokens"] = input_tokens
+            records.append(record)
+
+        report = analyze(list(reversed(records)))
+        findings = [
+            finding for finding in report.findings
+            if finding.category == "context_amplification"
+            and finding.title.startswith("Input context amplified")
+        ]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].record_ids, ["zero-step-1"])
+        self.assertIn("from 500 to 1400", findings[0].reason)
+        self.assertEqual(findings[0].saving_ratio, 0.0)
+
+    def test_missing_step_timestamps_sort_as_utc_instants(self):
+        # Offsets must be compared by the same UTC instant, not by ISO text.
+        # The first record is at 22:00 UTC, before both Z-suffixed records.
+        base = load_records(str(ROOT / "samples/simple.jsonl"))[0]
+        records = []
+        for index, (event_time, tokens) in enumerate((
+            ("2026-11-12T23:00:00+01:00", 500),
+            ("2026-11-12T22:30:00Z", 1400),
+            ("2026-11-12T22:40:00Z", 1700),
+        ), start=1):
+            record = copy.deepcopy(base)
+            record["record_id"] = f"timezone-{index}"
+            record["run"]["span_id"] = f"timezone-span-{index}"
+            record["run"].pop("step", None)
+            record["timing"]["event_time"] = event_time
+            record["usage"]["llm"]["input_tokens"] = tokens
+            records.append(record)
+
+        report = analyze(list(reversed(records)))
+        growth = [
+            finding for finding in report.findings
+            if finding.category == "context_amplification"
+            and finding.title.startswith("Input context amplified")
+        ]
+        self.assertEqual(len(growth), 1)
+        self.assertEqual(growth[0].record_ids, ["timezone-2"])
+        self.assertIn("from 500 to 1400", growth[0].reason)
+        self.assertEqual(growth[0].saving_ratio, 0.0)
+
+    def test_semantic_validation_does_not_claim_deterministic_savings(self):
+        record = copy.deepcopy(load_records(str(ROOT / "samples/inefficient_agent.jsonl"))[3])
+        record["run"]["name"] = "Validate subjective customer intent"
+        record["attribution"]["labels"] = {}
+        report = analyze([record])
+        findings = [f for f in report.findings if f.category == "deterministic_candidate"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertEqual(findings[0].saving_ratio, 0.0)
+        self.assertNotIn("strong candidate", findings[0].reason)
+        # A separate smaller-model hypothesis may still contribute an estimate.
+        # Semantic validation must add no *deterministic* savings to that baseline.
+        baseline = copy.deepcopy(record)
+        baseline["run"]["name"] = "Generate an answer"
+        self.assertEqual(report.potential_savings, analyze([baseline]).potential_savings)
+
+    def test_information_does_not_match_format_keyword(self):
+        record = copy.deepcopy(load_records(str(ROOT / "samples/inefficient_agent.jsonl"))[3])
+        record["run"]["name"] = "Summarize customer information"
+        record["attribution"]["labels"] = {}
+        report = analyze([record])
+        self.assertFalse(any(f.category == "deterministic_candidate" for f in report.findings))
+
+    def test_explicit_json_schema_validation_remains_a_candidate(self):
+        record = copy.deepcopy(load_records(str(ROOT / "samples/inefficient_agent.jsonl"))[3])
+        record["run"]["name"] = "Validate JSON schema"
+        record["attribution"]["labels"] = {}
+        report = analyze([record])
+        findings = [f for f in report.findings if f.category == "deterministic_candidate"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "medium")
+        self.assertIn("deterministic validation", findings[0].title)
+
+    def test_unrelated_json_transport_label_does_not_promote_subjective_validation(self):
+        record = copy.deepcopy(load_records(str(ROOT / "samples/inefficient_agent.jsonl"))[3])
+        record["run"]["name"] = "Validate subjective customer intent"
+        record["attribution"]["labels"] = {"transport": "json"}
+        report = analyze([record])
+        findings = [f for f in report.findings if f.category == "deterministic_candidate"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertEqual(findings[0].saving_ratio, 0.0)
+
+    def test_json_medical_correctness_is_not_structural_validation(self):
+        record = copy.deepcopy(load_records(str(ROOT / "samples/inefficient_agent.jsonl"))[3])
+        record["run"]["name"] = "Validate JSON response for medical correctness and patient safety"
+        record["attribution"]["labels"] = {}
+        report = analyze([record])
+        findings = [f for f in report.findings if f.category == "deterministic_candidate"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertEqual(findings[0].saving_ratio, 0.0)
+
+    def test_structural_word_with_semantic_safety_goal_stays_low_confidence(self):
+        record = copy.deepcopy(load_records(str(ROOT / "samples/inefficient_agent.jsonl"))[3])
+        record["run"]["name"] = "Validate JSON format for medical correctness and patient safety"
+        record["attribution"]["labels"] = {}
+        report = analyze([record])
+        findings = [f for f in report.findings if f.category == "deterministic_candidate"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertEqual(findings[0].saving_ratio, 0.0)
+
     def test_repeated_tool_is_candidate_not_high_confidence(self):
         report = analyze(load_records(str(ROOT / "samples/harness_waste.jsonl")))
         findings = [
@@ -121,6 +274,40 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(findings[0].confidence, "medium")
         self.assertIn("exact repeated tool call", findings[0].title)
         self.assertEqual(len(findings[0].record_ids), 1)
+
+    def test_changed_result_fingerprint_is_not_medium_confidence_duplicate(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/tool_fingerprints.jsonl"))[:2])
+        records[1]["attribution"]["labels"]["tool_result_hash"] = "sha256:ea35d0d0e3f11ddb762589af959f639c336fc332a095a91ffac51804574df410"
+        report = analyze(records)
+        findings = [f for f in report.findings if f.category == "repeated_tool_retrieval"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].record_ids, [records[1]["record_id"]])
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertIn("different result fingerprints", findings[0].reason)
+        self.assertNotIn("strong evidence of repeated work", findings[0].reason)
+        self.assertEqual(findings[0].saving_ratio, 0.0)
+
+    def test_missing_result_fingerprint_is_not_medium_confidence_duplicate(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/tool_fingerprints.jsonl"))[:2])
+        records[1]["attribution"]["labels"].pop("tool_result_hash")
+        report = analyze(records)
+        findings = [f for f in report.findings if f.category == "repeated_tool_retrieval"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertIn("missing result fingerprints", findings[0].reason)
+        self.assertEqual(findings[0].saving_ratio, 0.0)
+
+    def test_redaction_placeholder_does_not_prove_matching_tool_payloads(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/tool_fingerprints.jsonl"))[:2])
+        for record in records:
+            record["attribution"]["labels"]["tool_args_hash"] = "redacted"
+            record["attribution"]["labels"]["tool_result_hash"] = "redacted"
+        report = analyze(records)
+        findings = [f for f in report.findings if f.category == "repeated_tool_retrieval"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertNotIn("exact repeated tool call", findings[0].title)
+        self.assertEqual(findings[0].saving_ratio, 0.0)
 
     def test_repeated_tool_is_scoped_to_matching_trace_identity(self):
         source = load_records(str(ROOT / "samples/tool_fingerprints.jsonl"))[:2]
@@ -526,7 +713,10 @@ class AnalyzerTests(unittest.TestCase):
         same_trace = analyze(records)
         self.assertEqual(same_trace.runs, 1)
         self.assertEqual(same_trace.category_counts["duplicate_repeated"], 1)
-        self.assertAlmostEqual(same_trace.potential_savings["USD"], 0.002)
+        self.assertEqual(same_trace.potential_savings.get("USD", 0), 0)
+        matching_usage = [f for f in same_trace.findings if f.category == "duplicate_repeated"]
+        self.assertEqual(matching_usage[0].confidence, "low")
+        self.assertEqual(matching_usage[0].saving_ratio, 0.0)
 
         # One known and one unknown trace cannot prove a shared execution.
         records[1]["run"].pop("trace_id")
@@ -534,6 +724,35 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(incomplete_trace.runs, 2)
         self.assertEqual(incomplete_trace.category_counts["duplicate_repeated"], 0)
         self.assertEqual(incomplete_trace.potential_savings.get("USD", 0), 0)
+
+    def test_matching_usage_counters_are_not_proof_of_duplicate_model_work(self):
+        base = load_records(str(ROOT / "samples/simple.jsonl"))[0]
+        first = copy.deepcopy(base)
+        second = copy.deepcopy(base)
+        second["record_id"] = "unrelated-model-call"
+        second["run"]["span_id"] = "separate-span"
+        second["run"]["name"] = "Classify a different customer request"
+        report = analyze([first, second])
+        findings = [f for f in report.findings if f.category == "duplicate_repeated"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertEqual(findings[0].saving_ratio, 0.0)
+        self.assertEqual(report.potential_savings.get("USD", 0), 0)
+
+    def test_cross_run_equal_usage_counters_do_not_claim_reuse_savings(self):
+        base = load_records(str(ROOT / "samples/simple.jsonl"))[0]
+        first = copy.deepcopy(base)
+        second = copy.deepcopy(base)
+        second["record_id"] = "unrelated-run-same-usage"
+        second["run"]["run_id"] = "unrelated-run"
+        second["run"]["span_id"] = "unrelated-span"
+        second["run"]["name"] = "Different independent request"
+        report = analyze([first, second])
+        findings = [f for f in report.findings if f.category == "cache_reuse"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertEqual(findings[0].saving_ratio, 0.0)
+        self.assertEqual(report.potential_savings.get("USD", 0), 0)
 
     def test_cross_trace_model_context_is_not_combined(self):
         base = load_records(str(ROOT / "samples/simple.jsonl"))[0]
@@ -578,6 +797,111 @@ class AnalyzerTests(unittest.TestCase):
         for record in records:
             record["run"]["trace_id"] = "a" * 32
         self.assertGreater(analyze(records).category_counts["context_amplification"], 0)
+
+    def test_explicit_non_429_retry_is_not_double_counted_as_repeated_read(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/retry_lineage.jsonl")))
+        report = analyze(records)
+        self.assertEqual(report.category_counts["retry_overhead"], 1)
+        self.assertEqual(report.category_counts["rate_limit_retry_chain"], 0)
+        self.assertEqual(report.category_counts["repeated_tool_retrieval"], 0)
+
+    def test_conflicting_argument_hash_aliases_cannot_prove_exact_repeat(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/tool_fingerprints.jsonl"))[:2])
+        for i, record in enumerate(records):
+            record["attribution"]["labels"]["kora.tool_args_hash"] = "sha256:" + str(i + 1) * 64
+        findings = [f for f in analyze(records).findings if f.category == "repeated_tool_retrieval"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertNotIn("exact repeated tool call", findings[0].title)
+
+    def test_conflicting_result_hash_aliases_cannot_prove_exact_repeat(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/tool_fingerprints.jsonl"))[:2])
+        for i, record in enumerate(records):
+            record["attribution"]["labels"]["kora.tool_result_hash"] = "sha256:" + str(i + 1) * 64
+        findings = [f for f in analyze(records).findings if f.category == "repeated_tool_retrieval"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertNotIn("exact repeated tool call", findings[0].title)
+
+    def test_json_format_and_factual_truth_is_not_pure_structural_validation(self):
+        record = copy.deepcopy(load_records(str(ROOT / "samples/inefficient_agent.jsonl"))[3])
+        record["run"]["name"] = "Validate JSON format and factual truth"
+        report = analyze([record])
+        findings = [f for f in report.findings if f.category == "deterministic_candidate"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertEqual(findings[0].saving_ratio, 0.0)
+
+    def test_non_uuid_trace_hyphens_are_not_discarded(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/tool_fingerprints.jsonl"))[:2])
+        records[0]["run"]["trace_id"] = "trace-a"
+        records[1]["run"]["trace_id"] = "tracea"
+        report = analyze(records)
+        self.assertEqual(report.runs, 2)
+        self.assertEqual(report.category_counts["repeated_tool_retrieval"], 0)
+
+    def test_identical_valid_fingerprint_aliases_preserve_positive_evidence(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/tool_fingerprints.jsonl"))[:2])
+        for record in records:
+            labels = record["attribution"]["labels"]
+            labels["kora.tool_args_hash"] = labels["tool_args_hash"].upper().replace("SHA256", "sha256")
+            labels["kora.tool_result_hash"] = labels["tool_result_hash"]
+        findings = [f for f in analyze(records).findings if f.category == "repeated_tool_retrieval"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "medium")
+        self.assertIn("exact repeated tool call", findings[0].title)
+
+    def test_canonical_uuid_trace_separators_preserve_identity(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/tool_fingerprints.jsonl"))[:2])
+        records[0]["run"]["trace_id"] = "a" * 32
+        records[1]["run"]["trace_id"] = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        report = analyze(records)
+        self.assertEqual(report.runs, 1)
+        self.assertEqual(report.category_counts["repeated_tool_retrieval"], 1)
+
+    def test_opaque_trace_identifier_case_does_not_merge_executions(self):
+        records = copy.deepcopy(load_records(str(ROOT / "samples/tool_fingerprints.jsonl"))[:2])
+        records[0]["run"]["trace_id"] = "Trace-A"
+        records[1]["run"]["trace_id"] = "trace-a"
+        report = analyze(records)
+        self.assertEqual(report.category_counts["repeated_tool_retrieval"], 0)
+        self.assertEqual(report.runs, 2)
+
+    def test_eight_distinct_required_model_steps_do_not_create_savings(self):
+        source = copy.deepcopy(load_records(str(ROOT / "samples/inefficient_agent.jsonl"))[3])
+        records = []
+        for index in range(8):
+            record = copy.deepcopy(source)
+            record["record_id"] = f"necessary-step-{index}"
+            record["run"]["run_id"] = "eight-necessary-steps"
+            record["run"]["span_id"] = f"necessary-span-{index}"
+            record["run"]["step"] = index + 1
+            record["run"]["name"] = f"Complete necessary task {index}"
+            record["resource"]["name"] = "task-specialist-model"
+            record["usage"]["llm"]["input_tokens"] = 200 + index
+            record["cost"] = {"total_cost": 1.0, "currency": "USD"}
+            records.append(record)
+        report = analyze(records)
+        findings = [f for f in report.findings if f.category == "orchestration_overhead"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertEqual(findings[0].saving_ratio, 0.0)
+        self.assertEqual(report.potential_savings.get("USD", 0), 0)
+
+    def test_short_safety_critical_model_call_does_not_claim_swap_savings(self):
+        record = copy.deepcopy(load_records(str(ROOT / "samples/inefficient_agent.jsonl"))[3])
+        record["resource"]["name"] = "claude-sonnet-4"
+        record["run"]["name"] = "Decide safety-critical customer exception"
+        record["usage"]["llm"]["input_tokens"] = 120
+        record["usage"]["llm"]["output_tokens"] = 20
+        record["usage"]["llm"].pop("reasoning_tokens", None)
+        record["cost"] = {"total_cost": 1.0, "currency": "USD"}
+        report = analyze([record])
+        findings = [f for f in report.findings if f.category == "smaller_model_candidate"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].confidence, "low")
+        self.assertEqual(findings[0].saving_ratio, 0.0)
+        self.assertEqual(report.potential_savings.get("USD", 0), 0)
 
     def test_savings_do_not_exceed_observed_cost(self):
         report = analyze(load_records(str(ROOT / "samples/inefficient_agent.jsonl")))

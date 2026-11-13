@@ -1,9 +1,11 @@
+import math
 import re
 from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Any, Dict, List, Tuple
 
 from .model import AuditReport, Finding
+from .parser import InputError
 
 
 CATEGORY_REPEATED_TOOL = "repeated_tool_retrieval"
@@ -124,8 +126,14 @@ def _cost(record: Dict[str, Any]):
         return None
     value = cost.get("total_cost")
     currency = cost.get("currency")
-    if isinstance(value, (int, float)) and value >= 0 and isinstance(currency, str) and currency:
-        return float(value), currency.upper()
+    if type(value) in (int, float) and value >= 0 and isinstance(currency, str) and currency:
+        try:
+            finite_value = float(value)
+        except OverflowError as exc:
+            raise InputError("cost.total_cost exceeds supported finite numeric range") from exc
+        if not math.isfinite(finite_value):
+            raise InputError("cost.total_cost exceeds supported finite numeric range")
+        return finite_value, currency.upper()
     return None
 
 
@@ -169,12 +177,39 @@ def _label_fingerprint(record: Dict[str, Any], names: Tuple[str, ...]):
     return None
 
 
+def _content_hash(record: Dict[str, Any], names: Tuple[str, ...]):
+    """Use digest evidence only when it has a verifiable hash representation.
+
+    Values such as 'redacted' or 'sha256:placeholder' are metadata, not
+    evidence that two tool payloads are equal. Invalid hashes behave as absent.
+    This checks the digest's format, not its source or cryptographic provenance.
+    """
+    labels = record.get("attribution", {}).get("labels") or {}
+    if not isinstance(labels, dict):
+        return None
+    digests = set()
+    for name in names:
+        raw = labels.get(name)
+        if raw is None or raw == "":
+            continue
+        if not isinstance(raw, str):
+            return None
+        value = raw.strip()
+        if not value:
+            continue
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", value, re.IGNORECASE):
+            return None
+        digests.add(value.lower())
+    # Aliases are independent supplied claims. A disagreement is not evidence.
+    return next(iter(digests)) if len(digests) == 1 else None
+
+
 def _tool_args_hash(record: Dict[str, Any]):
-    return _label_fingerprint(record, TOOL_ARGS_HASH_LABELS)
+    return _content_hash(record, TOOL_ARGS_HASH_LABELS)
 
 
 def _tool_result_hash(record: Dict[str, Any]):
-    return _label_fingerprint(record, TOOL_RESULT_HASH_LABELS)
+    return _content_hash(record, TOOL_RESULT_HASH_LABELS)
 
 
 def _retry_of(record: Dict[str, Any]):
@@ -268,18 +303,23 @@ def _context_text(record: Dict[str, Any]) -> str:
     ).lower()
 
 
+def _valid_token_counter(value: Any) -> bool:
+    # JSON booleans are int subclasses in Python, not observed token counts.
+    return type(value) in (int, float) and value >= 0
+
+
 def _token_total(record: Dict[str, Any]) -> int:
     llm = record.get("usage", {}).get("llm", {})
-    return sum(
-        int(llm.get(k) or 0)
-        for k in ("input_tokens", "output_tokens", "reasoning_tokens")
-        if isinstance(llm.get(k, 0), (int, float))
-    )
+    fields = ("input_tokens", "output_tokens", "reasoning_tokens")
+    # One malformed present counter makes a short-call conclusion unreliable.
+    if any(k in llm and not _valid_token_counter(llm[k]) for k in fields):
+        return 0
+    return sum(int(llm.get(k, 0)) for k in fields)
 
 
 def _input_tokens(record: Dict[str, Any]):
     value = record.get("usage", {}).get("llm", {}).get("input_tokens")
-    return int(value) if isinstance(value, (int, float)) and value >= 0 else None
+    return int(value) if _valid_token_counter(value) else None
 
 
 def _cache_counters(record: Dict[str, Any]):
@@ -288,15 +328,11 @@ def _cache_counters(record: Dict[str, Any]):
         return None
     if "cache_read_tokens" not in llm and "cache_write_tokens" not in llm:
         return None
+    fields = ("input_tokens", "cache_read_tokens", "cache_write_tokens")
+    if any(k in llm and not _valid_token_counter(llm[k]) for k in fields):
+        return None
 
-    def _counter(name: str) -> int:
-        value = llm.get(name)
-        return int(value) if isinstance(value, (int, float)) and value >= 0 else 0
-
-    input_tokens = _counter("input_tokens")
-    cache_read = _counter("cache_read_tokens")
-    cache_write = _counter("cache_write_tokens")
-    return input_tokens, cache_read, cache_write
+    return tuple(int(llm.get(k, 0)) for k in fields)
 
 
 def _frontier_model(name: str) -> bool:
@@ -307,14 +343,19 @@ def _frontier_model(name: str) -> bool:
 
 
 def _ordered(group: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return sorted(
-        group,
-        key=lambda r: (
-            r.get("run", {}).get("step") is None,
-            r.get("run", {}).get("step") or 10**9,
-            str(r.get("timing", {}).get("event_time", "")),
-        ),
-    )
+    def key(record):
+        step = record.get("run", {}).get("step")
+        # ISO strings with different timezone offsets do not sort by instant.
+        # Keep missing or invalid timestamps after known instants, stable on ties.
+        timestamp = _parsed_event_time(record)
+        return (
+            step is None,
+            step if step is not None else 0,
+            timestamp is None,
+            timestamp if timestamp is not None else datetime.max.replace(tzinfo=timezone.utc),
+        )
+
+    return sorted(group, key=key)
 
 
 def _parsed_event_time(record: Dict[str, Any]):
@@ -330,10 +371,21 @@ def _parsed_event_time(record: Dict[str, Any]):
         return None
 
 
+def _canonical_id(value: Any, *, hex_length: int) -> str:
+    # Only exact-format OTel IDs may be case-folded. All other identifiers
+    # are opaque; changing their spelling can attach evidence to another run.
+    raw = str(value) if value is not None else ""
+    if hex_length == 32 and re.fullmatch(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", raw
+    ):
+        return raw.replace("-", "").lower()
+    if re.fullmatch(r"[0-9a-fA-F]{" + str(hex_length) + r"}", raw):
+        return raw.lower()
+    return raw
+
+
 def _trace_id(record: Dict[str, Any]) -> str:
-    # OTel trace IDs are hex strings; allow normalized UUID punctuation.
-    value = record.get("run", {}).get("trace_id")
-    return str(value).strip().lower().replace("-", "") if value is not None else ""
+    return _canonical_id(record.get("run", {}).get("trace_id"), hex_length=32)
 
 
 def analyze(records: List[Dict[str, Any]]) -> AuditReport:
@@ -348,7 +400,11 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
         c = _cost(record)
         if c:
             value, currency = c
-            observed_costs[currency] += value
+            combined = observed_costs[currency] + value
+            if not math.isfinite(combined):
+                # Never print Infinity or a partial cost total as measured data.
+                raise InputError("sum of cost.total_cost values exceeds supported finite numeric range")
+            observed_costs[currency] = combined
 
     if not observed_costs:
         warnings.append(
@@ -595,6 +651,9 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
         for finding in findings if finding.category == CATEGORY_RATE_LIMIT
         for record_id in finding.record_ids[1:]
     }
+    # Any verified explicit retry is already recorded under retry overhead,
+    # not a second independent tool retrieval. Keep each original root call.
+    retry_child_ids = set(resolved_retry_parents) | rate_limit_retry_ids
 
     # 2. Repeated tool/resource use inside one run.
     #
@@ -603,8 +662,8 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
     # as stronger evidence. Otherwise keep the old resource-only heuristic.
     by_run_tool = defaultdict(list)
     for record in tool_records:
-        if str(record["record_id"]) in rate_limit_retry_ids:
-            continue  # Already represented as an explicit HTTP 429 retry attempt.
+        if str(record["record_id"]) in retry_child_ids:
+            continue  # Already represented as a verified explicit retry attempt.
         run_id = str(record["run"]["run_id"])
         # Reused run IDs do not establish a shared execution across distinct traces.
         by_run_tool[(run_id, _trace_id(record), _tool_signature(record))].append(record)
@@ -638,20 +697,30 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
                     "and the same result fingerprint. This is strong evidence of repeated work, "
                     "though freshness or safety checks may still justify the second call."
                 )
+                confidence = "medium"
             else:
                 title = f"{len(duplicates)} same-argument tool call(s): {resource_name}"
-                reason = (
-                    "The same tool/resource repeated in one run with the same argument fingerprint. "
-                    "This is stronger evidence than a resource-name match alone, but changing external "
-                    "state can still make a repeated read legitimate."
-                )
+                known_results = [digest for digest in result_hashes if digest]
+                if len(set(known_results)) > 1:
+                    reason = (
+                        "The same tool and arguments were used, but different result fingerprints "
+                        "were observed. This does not establish duplicate results: a changed source "
+                        "or a legitimate freshness check may explain the repeated retrieval."
+                    )
+                else:
+                    reason = (
+                        "The same tool and arguments were used, but missing result fingerprints "
+                        "prevent confirmation of repeated output. A freshness or safety check may "
+                        "justify the second call."
+                    )
+                confidence = "low"
 
             findings.append(
                 Finding(
                     category=CATEGORY_REPEATED_TOOL,
                     title=title,
                     reason=reason,
-                    confidence="medium",
+                    confidence=confidence,
                     record_ids=[str(record["record_id"]) for record in duplicates],
                     run_ids=[run_id],
                     saving_ratio=0.0,
@@ -832,7 +901,8 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
                 )
             )
 
-    # 2. Model calls with identical usage/resource signatures in one run.
+    # 2. Model usage/resource counter collisions are diagnostics only.
+    # Token counts do not identify the prompt, output, or work performed.
     by_run_signature = defaultdict(list)
     for record in model_records:
         run_id = str(record["run"]["run_id"])
@@ -844,19 +914,20 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
             findings.append(
                 Finding(
                     category=CATEGORY_DUPLICATE,
-                    title=f"{len(duplicates)} repeated model call(s) in one run",
+                    title=f"{len(duplicates)} matching model usage signature(s) in one run",
                     reason=(
-                        "Same run, model/resource, operation, and reported usage counters repeat. "
-                        "AUDR has no prompt body, so this is a strong duplicate candidate, not proof."
+                        "Same run, model/resource, operation, and usage counters recur, but "
+                        "matching token counts do not establish identical prompts or outputs. "
+                        "Review distinct tasks before treating any call as redundant."
                     ),
-                    confidence="medium",
+                    confidence="low",
                     record_ids=[str(r["record_id"]) for r in duplicates],
                     run_ids=[run_id],
-                    saving_ratio=1.0,
+                    saving_ratio=0.0,
                 )
             )
 
-    # 3. Cross-run reuse candidates.
+    # 3. Cross-run matching usage counters cannot establish reusable work.
     by_signature = defaultdict(list)
     for record in model_records:
         by_signature[_usage_signature(record)].append(record)
@@ -876,29 +947,52 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
                     confidence="low",
                     record_ids=[str(r["record_id"]) for r in candidates],
                     run_ids=sorted(run_ids),
-                    saving_ratio=0.70,
+                    saving_ratio=0.0,
                 )
             )
 
-    # 4. Deterministic candidates. Validation/schema/format work is promoted to
-    # medium confidence when the call is small enough to look like a checker.
+    # 4. Deterministic candidates. A substring like "format" inside
+    # "information" is not evidence of a formatter. Validation by human
+    # judgment is not interchangeable with machine-checkable validation.
     for record in model_records:
         text = _context_text(record)
-        hit = next((kw for kw in DETERMINISTIC_KEYWORDS if kw in text), None)
+        task_text = str(record.get("run", {}).get("name") or "").lower()
+
+        def mentions(stem: str, source: str) -> bool:
+            return bool(re.search(r"(?<![a-z])" + re.escape(stem) + r"[a-z]*(?![a-z])", source))
+
+        hit = next((kw for kw in DETERMINISTIC_KEYWORDS if mentions(kw, text)), None)
         if hit:
             llm = record.get("usage", {}).get("llm", {})
             output_tokens = llm.get("output_tokens")
-            is_validation = any(kw in text for kw in VALIDATION_KEYWORDS)
-            small_checker = isinstance(output_tokens, (int, float)) and output_tokens <= 200
-            if is_validation and small_checker:
+            # Unrelated transport/trace labels do not describe the task's goal.
+            # Merely mentioning JSON is not evidence of schema/syntax checking.
+            is_validation = any(mentions(kw, task_text) for kw in VALIDATION_KEYWORDS)
+            # A positive word list cannot enumerate every subjective goal.
+            # Promote only names consisting entirely of structural-check words.
+            structural_only = bool(re.fullmatch(
+                r"(?:validate|check|verify|parse)\s+(?:(?:json|schema|format|syntax|structure|data|input|output|response|of|the)\s*)+",
+                task_text.strip(),
+            )) and any(mentions(kw, task_text) for kw in ("schema", "format", "syntax", "parse"))
+            small_checker = _valid_token_counter(output_tokens) and output_tokens <= 200
+            if is_validation and small_checker and structural_only:
                 title = "LLM used for deterministic validation"
                 reason = (
-                    "Run metadata indicates validation/schema/format checking and the call returned "
-                    f"{int(output_tokens)} output tokens. This is a strong candidate for JSON Schema, "
-                    "parsing, or another deterministic check."
+                    "The run name explicitly describes structural schema/format checking and the "
+                    f"call returned {int(output_tokens)} output tokens. This is a manual-review "
+                    "candidate, not proof that deterministic replacement is safe."
                 )
                 confidence = "medium"
-                saving_ratio = 0.90
+                saving_ratio = 0.0
+            elif is_validation:
+                title = "Validation task may require judgment"
+                reason = (
+                    "The run name mentions validation, but either lacks a clear structural-only "
+                    "rule or also includes semantic goals. Model judgment may still be needed; "
+                    "no deterministic replacement or cost saving is inferred."
+                )
+                confidence = "low"
+                saving_ratio = 0.0
             else:
                 title = "Possible deterministic step"
                 reason = (
@@ -906,7 +1000,7 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
                     "routing, validation, or fixed mappings. Payload evidence is not available in AUDR."
                 )
                 confidence = "low"
-                saving_ratio = 0.80
+                saving_ratio = 0.0
 
             findings.append(
                 Finding(
@@ -1063,19 +1157,21 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
         ordered = _ordered(group)
         if len(ordered) >= 6:
             extras = ordered[4:]
-            confidence = "medium" if len(ordered) >= 8 else "low"
+            # Call count alone is not evidence that any step was unnecessary.
+            confidence = "low"
             findings.append(
                 Finding(
                     category=CATEGORY_ORCHESTRATION,
                     title=f"{len(ordered)} model calls in a single agent run",
                     reason=(
-                        "More than four model calls were observed in one run. Later calls are marked as "
-                        "orchestration-overhead candidates; legitimate long-horizon work may still need them."
+                        "More than four model calls were observed in one run. Later calls merit "
+                        "review, but call count alone cannot establish redundant work. "
+                        "Multi-step tasks may require every call; no savings are inferred."
                     ),
                     confidence=confidence,
                     record_ids=[str(r["record_id"]) for r in extras],
                     run_ids=[run_id],
-                    saving_ratio=0.50,
+                    saving_ratio=0.0,
                 )
             )
 
@@ -1093,13 +1189,14 @@ def analyze(records: List[Dict[str, Any]]) -> AuditReport:
                     category=CATEGORY_SMALLER,
                     title=f"Short call on high-end model: {model}",
                     reason=(
-                        f"Only {total} reported input/output tokens and no reported reasoning tokens. "
-                        "A smaller model may be sufficient after execution waste is removed."
+                        f"Only {total} input/output tokens were reported, but token count and absent "
+                        "or zero reasoning-token telemetry do not establish task difficulty or "
+                        "safe model substitution. Evaluate quality and cost before changing models."
                     ),
                     confidence="low",
                     record_ids=[str(record["record_id"])],
                     run_ids=[str(record["run"]["run_id"])],
-                    saving_ratio=0.50,
+                    saving_ratio=0.0,
                 )
             )
 

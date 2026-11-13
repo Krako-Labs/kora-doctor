@@ -8,6 +8,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CliTests(unittest.TestCase):
+    def test_cli_version_matches_packaging_metadata(self):
+        import re
+        source = (ROOT / "pyproject.toml").read_text()
+        metadata_version = re.search(r'(?m)^version = "([^"]+)"$', source).group(1)
+        result = subprocess.run(
+            [sys.executable, "-m", "kora_doctor", "--version"],
+            cwd=ROOT, text=True, capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "kora-doctor " + metadata_version)
+
     def test_demo_without_user_trace_is_explicitly_synthetic(self):
         result = subprocess.run(
             [sys.executable, "-m", "kora_doctor", "demo"],
@@ -41,6 +52,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("KORA Doctor", result.stdout)
         self.assertIn("Illustrative savings", result.stdout)
+        self.assertIn("0% does not prove the run had no avoidable work", result.stdout)
         self.assertIn("Illustrative remainder", result.stdout)
         self.assertIn("not measured", result.stdout)
         self.assertIn("Do not remove calls", result.stdout)
@@ -69,7 +81,8 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(result.stdout)
-        self.assertGreater(report["potential_savings"]["USD"], 0)
+        self.assertEqual(report["potential_savings"]["USD"], 0)
+        self.assertGreater(report["observed_costs"]["USD"], 0)
         self.assertIn("estimated_optimized_costs", report)
         self.assertEqual(report["savings_basis"], "illustrative_heuristic_not_measured")
 
@@ -299,6 +312,74 @@ class CliTests(unittest.TestCase):
                     self.assertNotIn("private-customer-resource", result.stderr)
                     self.assertNotIn("Traceback", result.stderr)
 
+    def test_unrepresentable_cost_totals_fail_without_trace_leakage(self):
+        import json
+        import tempfile
+
+        base = json.loads((ROOT / "samples/simple.jsonl").read_text().splitlines()[0])
+        base["resource"]["name"] = "private-customer-cost-source"
+        second = json.loads(json.dumps(base))
+        second["record_id"] = "synthetic-second-record"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "large-cost.json"
+            invalid_cases = (
+                ("oversized_integer", [dict(base, cost={"total_cost": 10**400, "currency": "USD"})]),
+                ("finite_sum_overflow", [
+                    dict(base, cost={"total_cost": 1e308, "currency": "USD"}),
+                    dict(second, cost={"total_cost": 1e308, "currency": "USD"}),
+                ]),
+            )
+            for label, records in invalid_cases:
+                with self.subTest(case=label):
+                    path.write_text(json.dumps(records))
+                    result = subprocess.run(
+                        [sys.executable, "-m", "kora_doctor", "audit", str(path), "--json"],
+                        cwd=ROOT, text=True, capture_output=True,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn("cost.total_cost", result.stderr)
+                    self.assertNotIn("private-customer-cost-source", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+
+            # Ordinary finite amounts remain additive, not rejected.
+            path.write_text(json.dumps([
+                dict(base, cost={"total_cost": 0.25, "currency": "USD"}),
+                dict(second, cost={"total_cost": 0.75, "currency": "USD"}),
+            ]))
+            valid = subprocess.run(
+                [sys.executable, "-m", "kora_doctor", "audit", str(path), "--json"],
+                cwd=ROOT, text=True, capture_output=True,
+            )
+            self.assertEqual(valid.returncode, 0, valid.stderr)
+            self.assertEqual(json.loads(valid.stdout)["observed_costs"]["USD"], 1.0)
+
+    def test_malformed_nested_audr_does_not_emit_traceback_or_private_values(self):
+        import json
+        import tempfile
+
+        base = json.loads((ROOT / "samples/simple.jsonl").read_text().splitlines()[0])
+        base["resource"]["name"] = "sensitive-customer-name"
+        cases = (
+            ("llm container", {"usage": {"llm": []}}),
+            ("nested token", {"usage": {"llm": {"input_tokens": []}}}),
+            ("resource identity", {"resource": dict(base["resource"], provider=[])}),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "malformed-usage.json"
+            for label, update in cases:
+                with self.subTest(case=label):
+                    path.write_text(json.dumps(dict(base, **update)))
+                    result = subprocess.run(
+                        [sys.executable, "-m", "kora_doctor", "audit", str(path), "--json"],
+                        cwd=ROOT, text=True, capture_output=True,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn("kora-doctor: error:", result.stderr)
+                    self.assertNotIn("sensitive-customer-name", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+
     def test_cli_malformed(self):
         result = subprocess.run(
             [sys.executable, "-m", "kora_doctor", "audit", str(ROOT / "tests/fixtures/malformed.jsonl")],
@@ -308,6 +389,53 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 2)
         self.assertIn("error:", result.stderr)
+
+
+    def test_cli_conflicting_otel_identifier_aliases_are_private_exit_two(self):
+        import json
+        import tempfile
+
+        from kora_doctor.parser import load_records
+
+        record = load_records(str(ROOT / "samples/otel_audr.jsonl"))[0]
+        with tempfile.TemporaryDirectory() as directory:
+            sidecar = Path(directory) / "conflicting-otel.json"
+            sidecar.write_text(json.dumps({"spans": [{
+                "spanId": record["run"]["span_id"],
+                "span_id": "private-CANARY-otel-alias",
+                "traceId": record["run"]["trace_id"],
+                "attributes": {"operation_status": "failed"},
+            }]}))
+            result = subprocess.run(
+                [sys.executable, "-m", "kora_doctor", "audit",
+                 str(ROOT / "samples/otel_audr.jsonl"),
+                 "--otel", str(sidecar), "--json"],
+                cwd=ROOT, text=True, capture_output=True,
+            )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("conflicting span ID aliases", result.stderr)
+        self.assertNotIn("private-CANARY-otel-alias", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_cli_oversized_otel_json_integer_is_private_exit_two(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            sidecar = Path(directory) / "oversized-otel.json"
+            sidecar.write_text('{"spans":[{"spanId":"unmatched","attributes":{'
+                               '"private_integer":' + ('8' * 5000) + '}}]}')
+            result = subprocess.run(
+                [sys.executable, "-m", "kora_doctor", "audit",
+                 str(ROOT / "samples/otel_audr.jsonl"),
+                 "--otel", str(sidecar), "--json"],
+                cwd=ROOT, text=True, capture_output=True,
+            )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("invalid OTel JSON number", result.stderr)
+        self.assertNotIn('8' * 30, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
 
 if __name__ == "__main__":

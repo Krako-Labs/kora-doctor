@@ -2,7 +2,7 @@
 
 [← Back to the quick-start README](../README.md)
 
-This reference preserves the detailed v0.1.11 diagnostics, optional metadata, input validation, and savings assumptions. Findings are candidates, not evidence of actual saved costs or permission to delete calls.
+This reference describes the current development tree: diagnostics, optional metadata, input validation, and savings assumptions. The published `v0.1.11` may differ until local corrections are released. Findings are candidates, not evidence of actual saved costs or permission to delete calls.
 
 ---
 
@@ -35,6 +35,12 @@ The finding reports baseline-relative growth and the largest step-to-step
 delta. It still claims no savings from token growth alone because the trace
 does not prove which carried payload, if any, was unnecessary.
 
+For records without `run.step`, Doctor compares timezone-aware `event_time`
+values as UTC instants. Lexically sorting ISO strings with different offsets
+can reverse the actual call order and hide context growth. Missing or invalid
+timestamps come after known timestamps. When both a step and a usable timestamp
+are missing, original record order is only a fallback, not reliable chronology.
+
 ## Why the output says “candidate”
 
 AUDR v1.0.0 deliberately records usage/cost telemetry without prompt content or secrets. That is good for security, but it also means an AUDR record alone usually cannot prove that two model calls were semantically identical or that a task could definitely have been deterministic.
@@ -47,6 +53,8 @@ KORA Doctor therefore uses:
 - **confidence** for heuristic strength
 - **insufficient evidence** where the trace cannot support a stronger conclusion
 
+Cost fields and currency totals must fit the finite numeric reporting range. An extremely large integer or a sum that would produce `Infinity` fails with exit code `2`; the error does not echo trace values. Ordinary missing or malformed cost fields remain non-evidence rather than fabricated amounts.
+
 Savings are only calculated when `cost.total_cost` is present. Multiple currencies are never silently converted. **Illustrative savings are not measured savings.** Do not remove or reroute calls without replay and quality checks. In `--json`, the existing `potential_savings` and `estimated_optimized_costs` keys are preserved for compatibility, and `savings_basis=illustrative_heuristic_not_measured` explicitly marks their meaning.
 
 ### Current savings assumptions
@@ -55,13 +63,19 @@ The dollar estimate is a scenario estimate attached to each candidate, not a mea
 
 - repeated tool/read candidate: not included in savings without stronger request/freshness evidence
 - context amplification candidate: not included in savings without payload evidence
-- duplicate/repeated model call: 100% of that call's observed cost
-- cache/reuse candidate: 70%
-- deterministic candidate: 80–90% depending on evidence
-- orchestration-overhead candidate: 50%
-- smaller-model candidate: 50%
+- matching model usage signature in one run: **0%**; token counters cannot prove identical inputs or redundant work
+- cross-run matching usage signature: **0%**; counters cannot prove reusable inputs or a safe prompt-cache hit
+- deterministic candidate: **0%** (diagnostic only; even explicit schema checks need outcome validation before attributing avoidable cost)
+- orchestration-overhead candidate: **0%**; call count does not prove a step was unnecessary
+- smaller-model candidate: **0%**; call length and missing reasoning telemetry do not prove that substitution is safe
 
-If one call matches several rules, KORA Doctor uses only the largest ratio for that call; it never stacks savings estimates. These defaults are intentionally easy to inspect and change as real traces arrive.
+If one call matches several rules, KORA Doctor keeps the largest ratio for that record; it never stacks estimates. **Current metadata-only rules assign no quantifiable savings.** Reported `0%` reflects missing proof of avoidable work, **not** proof that an execution was optimal. Keep `potential_savings` and `estimated_optimized_costs` keys for existing JSON consumers. Only introduce nonzero attribution after safe, independent outcome evidence and measured cost comparisons.
+
+## Model usage signatures and identifier integrity
+
+Matching model, operation and token counters are a **low-confidence investigation signal**, not proof that two prompts or outputs match. Both within-run duplicate candidates and cross-run reuse candidates contribute **0 illustrative savings**. These findings remain visible so developers can compare them against their own verified workload evidence. Do not assume a 100% removable call or 70% cache benefit based on counter equality.
+
+The input parser rejects non-string, empty or whitespace-only `record_id`, `run.run_id`, and `run.span_id`. If `run.trace_id` is included, it must be a non-empty string without surrounding whitespace. Only canonical hexadecimal UUID trace identities are case/hyphen normalized; arbitrary trace labels retain their exact case. This prevents numeric/string and opaque-label collisions; parser errors do not repeat identifier values. Missing optional `trace_id` is allowed.
 
 ## Optional tool fingerprints
 
@@ -78,14 +92,22 @@ AUDR intentionally avoids raw tool arguments and results. KORA Doctor can still 
 }
 ```
 
+Tool argument/result equality only uses `sha256:` followed by 64 hexadecimal characters. Other strings (including `redacted`, placeholders, or incomplete hashes) are treated as missing fingerprint evidence. Format validation cannot prove the hash was generated honestly or that matching payloads imply safe call removal.
+
 When the same tool repeats in one run (and the same trace, if trace IDs are available):
 
 - same tool, no fingerprint -> low-confidence repeat candidate
-- same tool + same `tool_args_hash` -> medium-confidence same-argument repeat
-- same tool + same args hash + same `tool_result_hash` -> medium-confidence exact repeated-work evidence
+- same tool + same args hash, but missing or differing result hashes -> **low-confidence** repeat candidate, not confirmed duplicate output
+- same tool + same args hash + same result hash -> medium-confidence exact repeated-work evidence (still not proof of unnecessary work)
 - same tool + different argument hashes -> **not** treated as a duplicate
 
-KORA Doctor never needs the raw tool payload for this check, and fingerprint-based findings still do not claim guaranteed savings because freshness and safety checks can make a repeat legitimate.
+KORA Doctor never needs the raw tool payload for this check, and fingerprint-based findings still do not claim guaranteed savings because freshness and safety checks can make a repeat legitimate. A child call in a verified explicit retry lineage is recorded as retry overhead, not also as an independent repeated read; unrelated later reads remain eligible for review.
+
+## Validation candidates: structural vs semantic
+
+Doctor gives a small validation call **medium** diagnostic confidence only when its **entire run name** consists of a structural check verb and structural words (for example, `Validate JSON schema` or `Check JSON format`). Extra subjective goals, even if their wording is unfamiliar, keep the finding **low**. A JSON transport label is not task evidence, and `validate JSON response` can describe subjective correctness rather than syntax checking.
+
+A generic `validate customer intent` task remains a **low** confidence manual-review finding. Mixed tasks such as `validate JSON format for medical correctness and patient safety` also remain low-confidence: a structural keyword does not override an explicitly semantic goal. All deterministic candidates now contribute **zero** illustrative savings, even when the format is explicit: metadata alone cannot establish that the model can be replaced safely. Words must match at their start; `information` does not imply `format`. Conflicting fingerprint aliases are not accepted as matching payload evidence. Trace IDs remove hyphens only when they are canonical hexadecimal UUIDs; opaque identifiers preserve their original case.
 
 ## OTel sidecar enrichment
 
@@ -96,6 +118,7 @@ kora-doctor audit audr.jsonl --otel trace.json
 ```
 
 The sidecar accepts standard OTLP JSON `resourceSpans -> scopeSpans -> spans` as well as simpler JSON span arrays.
+OTel JSON integer literals longer than 128 characters are rejected as invalid input, including in unmatched spans. This avoids interpreter-dependent crashes; the CLI returns exit code `2` without printing raw trace data.
 
 When matching spans are found by `span_id` / `trace_id`, KORA Doctor can enrich the AUDR record with:
 
@@ -107,7 +130,9 @@ When matching spans are found by `span_id` / `trace_id`, KORA Doctor can enrich 
 
 Raw tool arguments and results are hashed in memory and are not copied into the KORA Doctor report.
 
-OTel matching is conservative. When both sides report trace IDs, they must agree. A repeated or ambiguous span match is ignored rather than assigning status or argument evidence to the wrong run. A unique span can still match when AUDR has no trace ID. Existing optional AUDR labels are preserved.
+For OTel fingerprinting, JSON objects and arrays are canonicalized by sorting JSON keys and removing formatting whitespace. **Raw tool text preserves its whitespace.** Even when an OTel string happens to contain a valid JSON scalar such as `42`, `true`, `null`, or a quoted string, it is hashed as text rather than converted to the scalar type. This prevents distinct tool text and typed scalar values from certifying an exact repeat. A matching digest does not prove the second call was unnecessary.
+
+OTel matching is conservative. OTel `spanId`/`span_id` and `traceId`/`trace_id` must be strings when supplied; malformed scalar identifiers are rejected without echoing their values. If both spellings are supplied for the same identifier, their canonical identities must agree; conflicting pairs cause a private input error (exit code `2`) even on an otherwise unmatched span. Equivalent canonical-hex spellings remain supported. Canonical 16-hex span IDs and 32-hex or UUID trace IDs may be case/UUID normalized. **Opaque span and trace IDs must match exactly**; case changes, punctuation removal, or whitespace trimming cannot establish that two IDs refer to the same execution. This same identity rule controls OTel-inferred retry grouping. When both sides report trace IDs, they must agree. A repeated or ambiguous span match is ignored rather than assigning status or argument evidence to the wrong run. A unique span may match without a trace ID **only when both AUDR and OTel omit the trace ID**. A trace ID reported by just one side is not sufficient proof to attach sidecar evidence. Existing optional AUDR labels are preserved.
 
 If AUDR and OTel disagree about a matching record's status, argument fingerprint, retry link, or other imported label, Doctor skips **all OTel enrichment for that record**. It keeps the original AUDR fields and reports the count of skipped source conflicts in CLI warnings. A conflict is not evidence that one source is correct or that the operation can be removed.
 
@@ -180,6 +205,10 @@ Prompt cache reuse: 0%  (0 read / 9,600 uncached; 3 calls)
 `usage.llm.input_tokens` in AUDR v1.0.0 is uncached input and excludes cache reads. KORA Doctor therefore calculates cache-read share from `input_tokens + cache_read_tokens`.
 
 It does **not** hard-code a universal cache-hit target. A low reuse rate becomes more interesting when the same run also shows persistent high context or context amplification.
+
+Context-growth, cache, and short-call findings require valid numeric usage counters. JSON booleans such as `"input_tokens": true` are **not** token counts. Doctor treats malformed token values as missing evidence for those findings and for structural-validation confidence, rather than treating them as `0` or `1`. This prevents unsupported findings; it does not validate the entire AUDR schema.
+
+If a resource identifier or a numeric counter contains a JSON array/object instead of a scalar, or `usage.llm` / `usage.tool` is not an object, Doctor rejects the malformed structure with **exit code 2** and a field-only error. It does not print the input value or an internal traceback. Other malformed scalar counters remain missing evidence, not measurements.
 
 ## AUDR compatibility
 

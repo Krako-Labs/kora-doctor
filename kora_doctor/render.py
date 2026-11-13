@@ -57,6 +57,8 @@ def render_text(report: AuditReport, top: int = 8) -> str:
             lines.append(f"Observed cost:                 {_money(total, currency):>12}")
             lines.append(f"Illustrative savings:         {_money(saved, currency):>12}  ({pct:.0f}%)")
             lines.append(f"Illustrative remainder:      {_money(optimized, currency):>12}")
+        if not any(value > 0 for value in report.potential_savings.values()):
+            lines.append("0% does not prove the run had no avoidable work; savings are unverified.")
     else:
         lines.append("Observed cost:                 not reported")
 

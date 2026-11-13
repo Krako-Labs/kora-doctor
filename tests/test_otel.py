@@ -10,6 +10,143 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class OtelTests(unittest.TestCase):
+    def test_otel_conflicting_identifier_aliases_fail_closed_even_unmatched(self):
+        import json
+        import tempfile
+        from kora_doctor.parser import InputError
+
+        records = load_records(str(ROOT / "samples/otel_audr.jsonl"))[:1]
+        for label, override in (
+            ("matched_span", {"span_id": "private-other-span"}),
+            ("matched_trace", {"trace_id": "private-other-trace"}),
+            ("unmatched_span", {"spanId": "unmatched-span", "span_id": "private-other-span"}),
+        ):
+            with self.subTest(case=label):
+                span = {
+                    "spanId": records[0]["run"]["span_id"],
+                    "traceId": records[0]["run"]["trace_id"],
+                    "attributes": {"gen_ai.tool.call.arguments": "private-payload"},
+                }
+                span.update(override)
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "sidecar.json"
+                    path.write_text(json.dumps({"spans": [span]}))
+                    with self.assertRaisesRegex(InputError, "conflicting .* ID aliases") as caught:
+                        enrich_with_otel(records, str(path))
+                self.assertNotIn("private", str(caught.exception))
+
+    def test_otel_equivalent_canonical_identifier_aliases_match(self):
+        import copy
+        import json
+        import tempfile
+
+        records = copy.deepcopy(load_records(str(ROOT / "samples/otel_audr.jsonl"))[:1])
+        records[0]["run"]["span_id"] = "AABBCCDDEEFF0011"
+        records[0]["run"]["trace_id"] = "01234567-89AB-CDEF-0123-456789ABCDEF"
+        span = {
+            "spanId": "AABBCCDDEEFF0011",
+            "span_id": "aabbccddeeff0011",
+            "traceId": "0123456789abcdef0123456789abcdef",
+            "trace_id": "01234567-89ab-cdef-0123-456789abcdef",
+            "attributes": {"gen_ai.tool.call.arguments": "private-payload"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sidecar.json"
+            path.write_text(json.dumps({"spans": [span]}))
+            enriched, stats = enrich_with_otel(records, str(path))
+        self.assertEqual(stats["matched"], 1)
+        self.assertEqual(stats["args_hashed"], 1)
+        self.assertNotIn("private-payload", str(enriched))
+
+    def test_otel_rejects_nonstring_span_trace_identity(self):
+        import copy
+        import json
+        import tempfile
+        from kora_doctor.parser import InputError
+
+        source = load_records(str(ROOT / "samples/otel_audr.jsonl"))[:1]
+        for field, value in (
+            ("spanId", 123), ("spanId", True), ("spanId", 0),
+            ("span_id", 123), ("traceId", 123), ("traceId", True),
+            ("trace_id", 123),
+        ):
+            with self.subTest(field=field, value_type=type(value).__name__):
+                records = copy.deepcopy(source)
+                span = {
+                    "spanId": records[0]["run"]["span_id"],
+                    "traceId": records[0]["run"]["trace_id"],
+                    "attributes": {"operation_status": "success"},
+                }
+                if field == "span_id":
+                    span.pop("spanId")
+                if field == "trace_id":
+                    span.pop("traceId")
+                span[field] = value
+                with tempfile.TemporaryDirectory() as directory:
+                    sidecar = Path(directory) / "sidecar.json"
+                    sidecar.write_text(json.dumps({"spans": [span]}))
+                    with self.assertRaisesRegex(InputError, "invalid OTel structure") as caught:
+                        enrich_with_otel(records, str(sidecar))
+                self.assertNotIn("private", str(caught.exception))
+
+    def test_otel_requires_bilateral_trace_evidence(self):
+        import copy
+        import json
+        import tempfile
+
+        source = load_records(str(ROOT / "samples/otel_audr.jsonl"))[:1]
+        for name, audr_trace, sidecar_trace, should_match in (
+            ("sidecar_missing", "opaque-A", None, False),
+            ("audr_missing", None, "opaque-A", False),
+            ("both_missing", None, None, True),
+            ("both_matching", "opaque-A", "opaque-A", True),
+        ):
+            with self.subTest(case=name):
+                records = copy.deepcopy(source)
+                if audr_trace is None:
+                    records[0]["run"].pop("trace_id", None)
+                else:
+                    records[0]["run"]["trace_id"] = audr_trace
+                span = {"spanId": records[0]["run"]["span_id"],
+                        "attributes": [{"key": "gen_ai.tool.call.arguments", "value": {"stringValue": "private-customer"}}]}
+                if sidecar_trace is not None:
+                    span["traceId"] = sidecar_trace
+                with tempfile.TemporaryDirectory() as directory:
+                    sidecar = Path(directory) / "sidecar.json"
+                    sidecar.write_text(json.dumps({"spans": [span]}))
+                    enriched, stats = enrich_with_otel(records, str(sidecar))
+                self.assertEqual(stats["matched"], int(should_match))
+                self.assertEqual("tool_args_hash" in enriched[0]["attribution"]["labels"], should_match)
+                self.assertNotIn("private-customer", str(enriched))
+
+    def test_otel_does_not_merge_opaque_trace_or_span_ids(self):
+        import copy
+        import json
+        import tempfile
+
+        base = load_records(str(ROOT / "samples/otel_audr.jsonl"))[:1]
+        for name, audr_trace, sidecar_trace, audr_span, sidecar_span, should_match in (
+            ("case_distinct", "Trace-A", "trace-a", "span-1", "span-1", False),
+            ("punctuation_distinct", "ab-cd", "abcd", "span-1", "span-1", False),
+            ("span_case_distinct", "trace-a", "trace-a", "Span-A", "span-a", False),
+            ("canonical_uuid", "01234567-89AB-CDEF-0123-456789ABCDEF", "0123456789abcdef0123456789abcdef", "AABBCCDDEEFF0011", "aabbccddeeff0011", True),
+        ):
+            with self.subTest(case=name):
+                records = copy.deepcopy(base)
+                records[0]["run"].update(trace_id=audr_trace, span_id=audr_span)
+                sidecar = {"spans": [{
+                    "traceId": sidecar_trace,
+                    "spanId": sidecar_span,
+                    "attributes": [{"key": "gen_ai.tool.call.arguments", "value": {"stringValue": "private-customer"}}],
+                }]}
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "sidecar.json"
+                    path.write_text(json.dumps(sidecar))
+                    enriched, stats = enrich_with_otel(records, str(path))
+                self.assertEqual(stats["matched"], int(should_match))
+                self.assertEqual("tool_args_hash" in enriched[0]["attribution"]["labels"], should_match)
+                self.assertNotIn("private-customer", str(enriched))
+
     def test_otel_rejects_wrong_scalar_anyvalue_types(self):
         import json
         import tempfile
@@ -65,6 +202,7 @@ class OtelTests(unittest.TestCase):
                 for value in (first, second):
                     span = {
                         "spanId": records[0]["run"]["span_id"],
+                    "traceId": records[0]["run"]["trace_id"],
                         "attributes": [
                             {"key": "gen_ai.tool.call.arguments", "value": value}
                         ],
@@ -96,6 +234,7 @@ class OtelTests(unittest.TestCase):
             with self.subTest(value_type=next(iter(value))):
                 span = {
                     "spanId": records[0]["run"]["span_id"],
+                    "traceId": records[0]["run"]["trace_id"],
                     "attributes": [
                         {"key": "gen_ai.tool.call.arguments", "value": value}
                     ],
@@ -317,6 +456,91 @@ class OtelTests(unittest.TestCase):
                     enriched, stats = enrich_with_otel(records, str(sidecar))
                 self.assertEqual(stats["spans"], 0)
                 self.assertEqual(enriched, records)
+
+    def test_otel_raw_text_whitespace_does_not_certify_equal_payloads(self):
+        import json
+        import tempfile
+
+        # OTel stringValue may hold raw tool text, where leading whitespace
+        # is meaningful. Only JSON payloads should be structurally normalized.
+        source = load_records(str(ROOT / "samples/otel_audr.jsonl"))
+        cases = (
+            ("arguments", "  private-request", "private-request",
+             "same-result", "same-result", False, True),
+            ("results", "same-request", "same-request",
+             "  private-result", "private-result", True, False),
+        )
+        for name, first_arg, second_arg, first_result, second_result, args_equal, results_equal in cases:
+            with self.subTest(variant=name):
+                spans = []
+                for record, arguments, result in zip(
+                    source, (first_arg, second_arg), (first_result, second_result)
+                ):
+                    spans.append({
+                        "spanId": record["run"]["span_id"],
+                        "traceId": record["run"]["trace_id"],
+                        "attributes": {
+                            "gen_ai.tool.call.arguments": arguments,
+                            "gen_ai.tool.call.result": result,
+                            "operation_status": "success",
+                        },
+                    })
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "otel-sidecar.json"
+                    path.write_text(json.dumps({"spans": spans}))
+                    enriched, stats = enrich_with_otel(source, str(path))
+                self.assertEqual(stats["matched"], 2)
+                left = enriched[0]["attribution"]["labels"]
+                right = enriched[1]["attribution"]["labels"]
+                self.assertEqual(left["tool_args_hash"] == right["tool_args_hash"], args_equal)
+                self.assertEqual(left["tool_result_hash"] == right["tool_result_hash"], results_equal)
+                self.assertEqual(stats["inferred_retries"], 0)
+                exact = [f for f in analyze(enriched).findings
+                         if f.category == "repeated_tool_retrieval" and f.confidence == "medium"]
+                self.assertEqual(exact, [])
+                self.assertNotIn("private-request", str(enriched))
+                self.assertNotIn("private-result", str(enriched))
+
+    def test_otel_json_scalar_looking_tool_text_cannot_certify_exact_repeat(self):
+        import json
+        import tempfile
+
+        # A tool can return text that happens to be valid JSON *scalar* text.
+        # Do not collapse distinct raw strings or coerce stringValue into an
+        # integer/bool AnyValue when deciding if two calls were identical.
+        source = load_records(str(ROOT / "samples/otel_audr.jsonl"))
+        cases = (
+            ("number_whitespace", " 42 ", "42"),
+            ("boolean_whitespace", "true", " true "),
+            ("null_whitespace", "null", "null\n"),
+            ("json_string_whitespace", '\"x\"', ' \"x\" '),
+            ("string_versus_integer", {"stringValue": "42"}, {"intValue": "42"}),
+            ("huge_number_like_text", "9" * 5000, "9" * 4999),
+        )
+        for name, first, second in cases:
+            with self.subTest(case=name):
+                spans = []
+                for record, value in zip(source, (first, second)):
+                    spans.append({
+                        "spanId": record["run"]["span_id"],
+                        "traceId": record["run"]["trace_id"],
+                        "attributes": [{
+                            "key": "gen_ai.tool.call.arguments",
+                            "value": value if isinstance(value, dict) else {"stringValue": value},
+                        }],
+                    })
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "otel-sidecar.json"
+                    path.write_text(json.dumps({"spans": spans}))
+                    enriched, stats = enrich_with_otel(source, str(path))
+                self.assertEqual(stats["matched"], 2)
+                hashes = [r["attribution"]["labels"]["tool_args_hash"] for r in enriched]
+                self.assertNotEqual(*hashes)
+                self.assertEqual(stats["inferred_retries"], 0)
+                medium_repeats = [f for f in analyze(enriched).findings
+                                  if f.category == "repeated_tool_retrieval"
+                                  and f.confidence == "medium"]
+                self.assertEqual(medium_repeats, [])
 
     def test_otel_sidecar_hashes_payloads_and_infers_retry(self):
         records = load_records(str(ROOT / "samples/otel_audr.jsonl"))
@@ -540,6 +764,7 @@ class OtelTests(unittest.TestCase):
         records = load_records(str(ROOT / "samples/otel_audr.jsonl"))
         span = {
             "spanId": records[0]["run"]["span_id"],
+                    "traceId": records[0]["run"]["trace_id"],
             "attributes": [
                 {"key": "http.response.status_code", "value": {"intValue": "429"}},
                 {"key": "http.response.header.retry-after", "value": {"stringValue": "private value"}},
@@ -679,7 +904,7 @@ class OtelTests(unittest.TestCase):
         self.assertNotIn("http_status_code", enriched[0]["attribution"]["labels"])
         self.assertEqual(enriched[1]["attribution"]["labels"]["http_status_code"], "429")
 
-    def test_otel_unique_span_id_without_audr_trace_id_is_allowed(self):
+    def test_otel_unique_span_id_without_audr_trace_id_is_rejected_when_sidecar_has_trace(self):
         import copy
         import json
         import tempfile
@@ -694,8 +919,8 @@ class OtelTests(unittest.TestCase):
             sidecar = Path(directory) / "single-no-trace.json"
             sidecar.write_text(json.dumps({"spans": [span]}))
             enriched, stats = enrich_with_otel(records, str(sidecar))
-        self.assertEqual(stats["matched"], 1)
-        self.assertEqual(enriched[0]["attribution"]["labels"]["http_status_code"], "429")
+        self.assertEqual(stats["matched"], 0)
+        self.assertEqual(enriched, records)
 
     def test_otel_enrichment_preserves_optional_seenrelay_labels(self):
         import copy
@@ -785,7 +1010,7 @@ class OtelTests(unittest.TestCase):
             "nonempty_result": True,
             "expected_repeat": False,
         }
-        span = {"spanId": records[0]["run"]["span_id"], "attributes": attrs}
+        span = {"spanId": records[0]["run"]["span_id"], "traceId": records[0]["run"]["trace_id"], "attributes": attrs}
         with tempfile.TemporaryDirectory() as directory:
             sidecar = Path(directory) / "otel.json"
             sidecar.write_text(json.dumps({"spans": [span]}))
@@ -799,6 +1024,23 @@ class OtelTests(unittest.TestCase):
         serialized = str(enriched)
         self.assertNotIn('"customer_id":42', serialized)
         self.assertNotIn('"name":"Ada"', serialized)
+
+
+    def test_otel_oversized_raw_json_integer_fails_closed_on_all_python_versions(self):
+        import tempfile
+        from kora_doctor.parser import InputError
+
+        records = load_records(str(ROOT / "samples/otel_audr.jsonl"))[:1]
+        # Raw numeric OTel metadata can exceed Python 3.13's int conversion
+        # limit. Python 3.9 accepts it, so enforce the same safe input bound.
+        for digits in (129, 5000):
+            with self.subTest(digits=digits), tempfile.TemporaryDirectory() as directory:
+                sidecar = Path(directory) / "synthetic-oversized-otel.json"
+                sidecar.write_text('{"spans":[{"spanId":"unmatched","attributes":{'
+                                   '"private_integer":' + ('8' * digits) + '}}]}')
+                with self.assertRaisesRegex(InputError, "invalid OTel JSON number") as caught:
+                    enrich_with_otel(records, str(sidecar))
+                self.assertNotIn('8' * 30, str(caught.exception))
 
 
 if __name__ == "__main__":
